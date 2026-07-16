@@ -7,7 +7,6 @@ pub use futures;
 pub use protobuf;
 pub use protos::message as message_proto;
 pub use protos::rendezvous as rendezvous_proto;
-use serde_derive::{Deserialize, Serialize};
 use std::{
     fs::File,
     io::{self, BufRead},
@@ -17,10 +16,8 @@ use std::{
 };
 pub use tokio;
 pub use tokio_util;
-pub mod proxy;
 pub mod socket_client;
 pub mod tcp;
-pub mod udp;
 pub use env_logger;
 pub use log;
 pub mod bytes_codec;
@@ -35,17 +32,16 @@ pub use mac_address;
 pub use rand;
 pub use regex;
 pub use sodiumoxide;
-pub use tokio_socks;
-pub use tokio_socks::IntoTargetAddr;
-pub use tokio_socks::TargetAddr;
 pub mod password_security;
 pub use chrono;
 pub use directories_next;
 pub use libc;
 pub mod keyboard;
+pub mod lan;
 pub use base64;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use dlopen;
+pub use flexi_logger;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub use machine_uid;
 pub use serde_derive;
@@ -55,12 +51,7 @@ pub use sysinfo;
 pub use thiserror;
 pub use toml;
 pub use uuid;
-pub mod fingerprint;
-pub use flexi_logger;
 pub mod stream;
-pub mod websocket;
-#[cfg(feature = "webrtc")]
-pub mod webrtc;
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub use rustls_platform_verifier;
 pub use stream::Stream;
@@ -68,9 +59,9 @@ pub use whoami;
 pub mod tls;
 pub mod verifier;
 pub use async_recursion;
+pub use libloading;
 #[cfg(target_os = "linux")]
 pub use users;
-pub use libloading;
 #[cfg(target_os = "linux")]
 pub use x11;
 
@@ -432,7 +423,9 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         #[cfg(debug_assertions)]
         {
             use env_logger::*;
-            init_from_env(Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn"));
+            init_from_env(
+                Env::default().filter_or(DEFAULT_FILTER_ENV, "info,reqwest=warn,rustls=warn"),
+            );
         }
         #[cfg(not(debug_assertions))]
         {
@@ -447,7 +440,7 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
                 path.push(_name);
             }
             use flexi_logger::*;
-            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn,webrtc-sctp=warn,webrtc=warn") {
+            if let Ok(x) = Logger::try_with_env_or_str("debug,reqwest=warn,rustls=warn") {
                 logger_holder = x
                     .log_to_file(FileSpec::default().directory(path))
                     .write_mode(if _is_async {
@@ -467,51 +460,6 @@ pub fn init_log(_is_async: bool, _name: &str) -> Option<flexi_logger::LoggerHand
         }
     });
     logger_holder
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct VersionCheckRequest {
-    #[serde(default)]
-    pub os: String,
-    #[serde(default)]
-    pub os_version: String,
-    #[serde(default)]
-    pub arch: String,
-    #[serde(default)]
-    pub device_id: Vec<u8>,
-    #[serde(default)]
-    pub typ: String,
-}
-
-#[derive(Debug, Default, Deserialize, Serialize)]
-pub struct VersionCheckResponse {
-    #[serde(default)]
-    pub url: String,
-}
-
-pub const VER_TYPE_RUSTDESK_CLIENT: &str = "rustdesk-client";
-pub const VER_TYPE_RUSTDESK_SERVER: &str = "rustdesk-server";
-
-pub fn version_check_request(typ: String) -> (VersionCheckRequest, String) {
-    const URL: &str = "https://api.rustdesk.com/version/latest";
-
-    use sysinfo::System;
-    let system = System::new();
-    let os = system.distribution_id();
-    let os_version = system.os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH.to_string();
-    #[allow(deprecated)]
-    let device_id = fingerprint::get_fingerprint(None, None);
-    (
-        VersionCheckRequest {
-            os,
-            os_version,
-            arch,
-            device_id,
-            typ,
-        },
-        URL.to_string(),
-    )
 }
 
 pub fn time_based_rand() -> u32 {

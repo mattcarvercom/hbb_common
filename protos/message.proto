@@ -69,6 +69,28 @@ message OSLogin {
   string password = 2;
 }
 
+// LAN-only protocol messages. Version 1 clients and servers intentionally do
+// not negotiate or downgrade to the legacy rendezvous/direct protocol.
+message LanClientHello {
+  uint32 protocol_version = 1;
+  bytes client_nonce = 2;
+  uint64 client_capabilities = 3;
+}
+
+message LanServerHello {
+  uint32 protocol_version = 1;
+  bytes server_nonce = 2;
+  bytes device_public_key = 3;
+  bytes ephemeral_public_key = 4;
+  bytes signature = 5;
+}
+
+message LanLoginRequest {
+  string access_username = 1;
+  bytes access_password = 2;
+  uint64 credential_revision_hint = 3;
+}
+
 message LoginRequest {
   string username = 1;
   bytes password = 2;
@@ -88,6 +110,7 @@ message LoginRequest {
   string my_platform = 13;
   bytes hwid = 14;
   string avatar = 17;
+  LanLoginRequest lan_login = 18;
 }
 
 message Terminal {
@@ -150,6 +173,8 @@ message LoginResponse {
     PeerInfo peer_info = 2;
   }
   bool enable_trusted_devices = 3;
+  // Non-zero values prevent LAN clients from retrying authentication early.
+  uint32 retry_after_seconds = 4;
 }
 
 message TouchScaleUpdate {
@@ -730,7 +755,7 @@ message MessageBox {
   string text = 3;
   // If not empty, msgbox provides a button to following the link.
   // The link here can't be directly http url.
-  // It must be the key of http url configed in peer side or "rustdesk://*" (jump in app).
+  // It must be the key of http url configured in peer side or "subnetdesk://*" (jump in app).
   string link = 4;
 }
 
@@ -981,5 +1006,7 @@ message Message {
     ScreenshotResponse screenshot_response= 30;
     TerminalAction terminal_action = 31;
     TerminalResponse terminal_response = 32;
+    LanClientHello lan_client_hello = 33;
+    LanServerHello lan_server_hello = 34;
   }
 }

@@ -1,4 +1,4 @@
-use crate::{bail, bytes_codec::BytesCodec, ResultType, config::Socks5Server, proxy::Proxy};
+use crate::{bail, bytes_codec::BytesCodec, ResultType};
 use anyhow::Context as AnyhowCtx;
 use bytes::{BufMut, Bytes, BytesMut};
 use futures::{SinkExt, StreamExt};
@@ -18,7 +18,6 @@ use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     net::{lookup_host, TcpListener, TcpSocket, ToSocketAddrs},
 };
-use tokio_socks::IntoTargetAddr;
 use tokio_util::codec::Framed;
 
 pub trait TcpStreamTrait: AsyncRead + AsyncWrite + Unpin {}
@@ -62,7 +61,10 @@ impl DerefMut for DynTcpStream {
     }
 }
 
-pub(crate) fn new_socket(addr: std::net::SocketAddr, reuse: bool) -> Result<TcpSocket, std::io::Error> {
+pub(crate) fn new_socket(
+    addr: std::net::SocketAddr,
+    reuse: bool,
+) -> Result<TcpSocket, std::io::Error> {
     let socket = match addr {
         std::net::SocketAddr::V4(..) => TcpSocket::new_v4()?,
         std::net::SocketAddr::V6(..) => TcpSocket::new_v6()?,
@@ -86,41 +88,42 @@ impl FramedStream {
         local_addr: Option<SocketAddr>,
         ms_timeout: u64,
     ) -> ResultType<Self> {
-        for remote_addr in lookup_host(&remote_addr).await? {
+        let display = remote_addr.to_string();
+        let addresses: Vec<_> = lookup_host(&remote_addr)
+            .await
+            .map_err(|err| crate::anyhow::anyhow!("DNS resolution failed for {display}: {err}"))?
+            .collect();
+        if addresses.is_empty() {
+            bail!("DNS resolution returned no address for {display}");
+        }
+        let mut last_error = "route unavailable".to_owned();
+        for remote_addr in addresses {
             let local = if let Some(addr) = local_addr {
                 addr
             } else {
                 crate::config::Config::get_any_listen_addr(remote_addr.is_ipv4())
             };
-            if let Ok(socket) = new_socket(local, true) {
-                if let Ok(Ok(stream)) =
-                    super::timeout(ms_timeout, socket.connect(remote_addr)).await
-                {
-                    stream.set_nodelay(true).ok();
-                    let addr = stream.local_addr()?;
-                    return Ok(Self(
-                        Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
-                        addr,
-                        None,
-                        0,
-                    ));
-                }
+            match new_socket(local, true) {
+                Ok(socket) => match super::timeout(ms_timeout, socket.connect(remote_addr)).await {
+                    Ok(Ok(stream)) => {
+                        stream.set_nodelay(true).ok();
+                        let addr = stream.local_addr()?;
+                        return Ok(Self(
+                            Framed::new(DynTcpStream(Box::new(stream)), BytesCodec::new()),
+                            addr,
+                            None,
+                            0,
+                        ));
+                    }
+                    Ok(Err(err)) => {
+                        last_error = format!("{} ({})", err, format!("{:?}", err.kind()));
+                    }
+                    Err(_) => last_error = format!("connection timed out after {ms_timeout} ms"),
+                },
+                Err(err) => last_error = format!("failed to bind local socket: {err}"),
             }
         }
-        bail!(format!("Failed to connect to {remote_addr}"));
-    }
-
-    pub async fn connect<'t, T>(
-        target: T,
-        local_addr: Option<SocketAddr>,
-        proxy_conf: &Socks5Server,
-        ms_timeout: u64,
-    ) -> ResultType<Self>
-    where
-        T: IntoTargetAddr<'t>,
-    {
-        let proxy = Proxy::from_conf(proxy_conf, Some(ms_timeout))?;
-        proxy.connect::<T>(target, local_addr).await
+        bail!("Failed to connect to {display}: {last_error}");
     }
 
     pub fn local_addr(&self) -> SocketAddr {
