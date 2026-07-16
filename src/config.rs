@@ -10,7 +10,10 @@ use std::{
 };
 
 use anyhow::{anyhow, Result};
-use bytes::Bytes;
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Algorithm, Argon2, Params, Version,
+};
 use rand::Rng;
 use regex::Regex;
 use serde as de;
@@ -41,20 +44,92 @@ use crate::{
     },
 };
 
-pub const RENDEZVOUS_TIMEOUT: u64 = 12_000;
 pub const CONNECT_TIMEOUT: u64 = 18_000;
 pub const READ_TIMEOUT: u64 = 18_000;
 // https://github.com/quic-go/quic-go/issues/525#issuecomment-294531351
 // https://datatracker.ietf.org/doc/html/draft-hamilton-early-deployment-quic-00#section-6.10
 // 15 seconds is recommended by quic, though oneSIP recommend 25 seconds,
 // https://www.onsip.com/voip-resources/voip-fundamentals/what-is-nat-keepalive
-pub const REG_INTERVAL: i64 = 15_000;
 pub const COMPRESS_LEVEL: i32 = 3;
-const SERIAL: i32 = 3;
+const LAN_ARGON2_MEMORY_KIB: u32 = 64 * 1024;
+const LAN_ARGON2_ITERATIONS: u32 = 3;
+const LAN_ARGON2_PARALLELISM: u32 = 1;
+const LAN_SCHEMA_VERSION: u32 = 1;
+
+pub fn is_lan_only_obsolete_option(key: &str) -> bool {
+    matches!(
+        key,
+        "id-server"
+            | "rendezvous-server"
+            | "custom-rendezvous-server"
+            | "rendezvous-servers"
+            | "relay-server"
+            | "api-server"
+            | "key"
+            | "proxy-url"
+            | "proxy-username"
+            | "proxy-password"
+            | "enable-udp-punch"
+            | "enable-ipv6-punch"
+            | "allow-websocket"
+            | "force-always-relay"
+            | "access-token"
+            | "direct-server"
+            | "direct-access-port"
+            | "access-mode"
+            | "approve-mode"
+            | "verification-method"
+            | "temporary-password-length"
+            | "allow-numeric-one-time-password"
+            | "enable-perm-change-in-accept-window"
+            | "allow-remote-config-modification"
+            | "allow-hide-cm"
+            | "disable-change-id"
+            | "enable-check-update"
+            | "allow-auto-update"
+            | "sync-ab-with-recent-sessions"
+            | "sync-ab-tags"
+            | "filter-ab-by-intersection"
+            | "preset-address-book-name"
+            | "preset-address-book-tag"
+            | "preset-address-book-alias"
+            | "preset-address-book-password"
+            | "preset-address-book-note"
+            | "enable-trusted-devices"
+            | "register-device"
+    )
+}
+
+fn lan_argon2() -> Result<Argon2<'static>> {
+    let params = Params::new(
+        LAN_ARGON2_MEMORY_KIB,
+        LAN_ARGON2_ITERATIONS,
+        LAN_ARGON2_PARALLELISM,
+        None,
+    )
+    .map_err(|err| anyhow!("Invalid LAN Argon2 parameters: {err}"))?;
+    Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+}
+
+fn hash_lan_password(password: &[u8]) -> Result<String> {
+    crate::lan::validate_password(password)?;
+    let salt = SaltString::generate(&mut OsRng);
+    lan_argon2()?
+        .hash_password(password, &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| anyhow!("Failed to hash access password: {err}"))
+}
+
+fn verify_lan_password_hash(password_hash: &str, password: &[u8]) -> Result<bool> {
+    crate::lan::validate_password(password)?;
+    let parsed = PasswordHash::new(password_hash)
+        .map_err(|err| anyhow!("Invalid stored access password hash: {err}"))?;
+    Ok(lan_argon2()?.verify_password(password, &parsed).is_ok())
+}
 
 #[cfg(target_os = "macos")]
 lazy_static::lazy_static! {
-    pub static ref ORG: RwLock<String> = RwLock::new("com.carriez".to_owned());
+pub static ref ORG: RwLock<String> = RwLock::new("com.zibochen".to_owned());
 }
 
 type Size = (i32, i32, i32, i32);
@@ -65,11 +140,7 @@ lazy_static::lazy_static! {
     static ref CONFIG2: RwLock<Config2> = RwLock::new(Config2::load());
     static ref LOCAL_CONFIG: RwLock<LocalConfig> = RwLock::new(LocalConfig::load());
     static ref STATUS: RwLock<Status> = RwLock::new(Status::load());
-    static ref TRUSTED_DEVICES: RwLock<(Vec<TrustedDevice>, bool)> = Default::default();
-    static ref ONLINE: Mutex<HashMap<String, i64>> = Default::default();
-    pub static ref PROD_RENDEZVOUS_SERVER: RwLock<String> = RwLock::new("".to_owned());
-    pub static ref EXE_RENDEZVOUS_SERVER: RwLock<String> = Default::default();
-    pub static ref APP_NAME: RwLock<String> = RwLock::new("RustDesk".to_owned());
+    pub static ref APP_NAME: RwLock<String> = RwLock::new("SubnetDesk".to_owned());
     static ref KEY_PAIR: Mutex<Option<KeyPair>> = Default::default();
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
@@ -97,30 +168,12 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
-pub const LINK_DOCS_HOME: &str = "https://rustdesk.com/docs/en/";
-pub const LINK_DOCS_X11_REQUIRED: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
-
-lazy_static::lazy_static! {
-    pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
-        ("rustdesk docs home", LINK_DOCS_HOME),
-        ("rustdesk docs x11-required", LINK_DOCS_X11_REQUIRED),
-        ]);
-}
-
 const NUM_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
 const CHARS: &[char] = &[
     '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k',
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
-
-pub const RENDEZVOUS_SERVERS: &[&str] = &["rs-ny.rustdesk.com"];
-pub const RS_PUB_KEY: &str = "OeVuKk5nlHiXp+APNn0Y3pC1Iwpwn44JGqrQCsWqmBw=";
-
-pub const RENDEZVOUS_PORT: i32 = 21116;
-pub const RELAY_PORT: i32 = 21117;
-pub const WS_RENDEZVOUS_PORT: i32 = 21118;
-pub const WS_RELAY_PORT: i32 = 21119;
 
 #[inline]
 pub fn is_service_ipc_postfix(postfix: &str) -> bool {
@@ -197,13 +250,7 @@ macro_rules! serde_field_bool {
     };
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum NetworkType {
-    Direct,
-    ProxySocks,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Default, Serialize, Deserialize, Clone, PartialEq)]
 pub struct Config {
     #[serde(
         default,
@@ -221,8 +268,40 @@ pub struct Config {
     key_pair: KeyPair, // sk, pk
     #[serde(default, deserialize_with = "deserialize_bool")]
     key_confirmed: bool,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    access_username: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    access_password_hash: String,
+    #[serde(default, deserialize_with = "deserialize_u64")]
+    credential_revision: u64,
+    #[serde(default, deserialize_with = "deserialize_u32")]
+    lan_schema_version: u32,
+    // TOML tables must follow all scalar values when serialized by toml 0.5.
     #[serde(default, deserialize_with = "deserialize_hashmap_string_bool")]
     keys_confirmed: HashMap<String, bool>,
+    #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
+    trusted_lan_endpoints: HashMap<String, String>,
+}
+
+impl std::fmt::Debug for Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Config")
+            .field("id", &self.id)
+            .field("key_pair_configured", &!self.key_pair.0.is_empty())
+            .field("key_confirmed", &self.key_confirmed)
+            .field(
+                "trusted_lan_endpoint_count",
+                &self.trusted_lan_endpoints.len(),
+            )
+            .field(
+                "access_username_configured",
+                &!self.access_username.is_empty(),
+            )
+            .field("access_password_hash", &"<redacted>")
+            .field("credential_revision", &self.credential_revision)
+            .field("lan_schema_version", &self.lan_schema_version)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize, Clone)]
@@ -451,11 +530,6 @@ pub struct TransferSerde {
     pub read_jobs: Vec<String>,
 }
 
-#[inline]
-pub fn get_online_state() -> i64 {
-    *ONLINE.lock().unwrap().values().max().unwrap_or(&0)
-}
-
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn patch(path: PathBuf) -> PathBuf {
     if let Some(_tmp) = path.to_str() {
@@ -489,14 +563,7 @@ fn patch(path: PathBuf) -> PathBuf {
 impl Config2 {
     fn load() -> Config2 {
         let mut config = Config::load_::<Config2>("2");
-        let mut store = false;
-        if let Some(mut socks) = config.socks {
-            let (password, _, store2) =
-                decrypt_str_or_original(&socks.password, PASSWORD_ENC_VERSION);
-            socks.password = password;
-            config.socks = Some(socks);
-            store |= store2;
-        }
+        let mut store = config.sanitize_lan_only();
         let (unlock_pin, _, store2) =
             decrypt_str_or_original(&config.unlock_pin, PASSWORD_ENC_VERSION);
         config.unlock_pin = unlock_pin;
@@ -505,6 +572,17 @@ impl Config2 {
             config.store();
         }
         config
+    }
+
+    fn sanitize_lan_only(&mut self) -> bool {
+        let before = self.clone();
+        self.rendezvous_server.clear();
+        self.nat_type = 0;
+        self.trusted_devices.clear();
+        self.socks = None;
+        self.options
+            .retain(|key, _| !is_lan_only_obsolete_option(key));
+        *self != before
     }
 
     pub fn file() -> PathBuf {
@@ -533,7 +611,8 @@ impl Config2 {
         return CONFIG2.read().unwrap().clone();
     }
 
-    pub fn set(cfg: Config2) -> bool {
+    pub fn set(mut cfg: Config2) -> bool {
+        cfg.sanitize_lan_only();
         let mut lock = CONFIG2.write().unwrap();
         if *lock == cfg {
             return false;
@@ -594,7 +673,7 @@ impl Config {
         let file = Self::file_(suffix);
         let cfg = load_path(file);
         if suffix.is_empty() {
-            log::trace!("{:?}", cfg);
+            log::trace!("Loaded primary configuration");
         }
         cfg
     }
@@ -608,46 +687,30 @@ impl Config {
 
     fn load() -> Config {
         let mut config = Config::load_::<Config>("");
-        let mut store = false;
-        if let Err(err) = Self::validate_or_decrypt_permanent_password_storage(&mut config) {
-            log::error!("Failed to validate or decrypt permanent password storage: {err}");
-        }
-        let mut id_valid = false;
-        let (id, encrypted, store2) = decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if encrypted {
-            config.id = id;
-            id_valid = true;
-            store |= store2;
-        } else if
-        // Comment out for forward compatible
-        // crate::get_modified_time(&Self::file_(""))
-        // .checked_sub(std::time::Duration::from_secs(30)) // allow modification during installation
-        // .unwrap_or_else(crate::get_exe_time)
-        // < crate::get_exe_time()
-        // &&
-        !config.id.is_empty()
-            && config.enc_id.is_empty()
-            && !decrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION).1
-        {
-            id_valid = true;
-            store = true;
-        }
-        if !id_valid {
-            log::warn!("ID is invalid, generating new one");
-            for _ in 0..3 {
-                if let Some(id) = Config::gen_id() {
-                    config.id = id;
-                    store = true;
-                    break;
-                } else {
-                    log::error!("Failed to generate new id");
-                }
-            }
-        }
-        if store {
-            config.store();
+        Ab::remove();
+        Group::remove();
+        if config.sanitize_lan_only() {
+            Config::store_(&config, "");
         }
         config
+    }
+
+    fn sanitize_lan_only(&mut self) -> bool {
+        let changed = !self.id.is_empty()
+            || !self.enc_id.is_empty()
+            || !self.password.is_empty()
+            || !self.salt.is_empty()
+            || self.key_confirmed
+            || !self.keys_confirmed.is_empty()
+            || self.lan_schema_version != LAN_SCHEMA_VERSION;
+        self.id.clear();
+        self.enc_id.clear();
+        self.password.clear();
+        self.salt.clear();
+        self.key_confirmed = false;
+        self.keys_confirmed.clear();
+        self.lan_schema_version = LAN_SCHEMA_VERSION;
+        changed
     }
 
     fn validate_or_decrypt_permanent_password_storage(config: &mut Config) -> Result<()> {
@@ -722,13 +785,8 @@ impl Config {
             config.password =
                 keep_encrypted_storage_if_plaintext_unchanged(&config.password, &stored.password);
         }
-        let (stored_id, encrypted, _) =
-            decrypt_str_or_original(&config.enc_id, PASSWORD_ENC_VERSION);
-        if !encrypted || stored_id != config.id {
-            config.enc_id =
-                encrypt_str_or_original(&config.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        }
-        config.id = "".to_owned();
+        config.id.clear();
+        config.enc_id.clear();
         Config::store_(&config, "");
     }
 
@@ -742,7 +800,7 @@ impl Config {
     }
 
     pub fn is_empty(&self) -> bool {
-        (self.id.is_empty() && self.enc_id.is_empty()) || self.key_pair.0.is_empty()
+        self.key_pair.0.is_empty()
     }
 
     /// Get the user's home directory for configuration purposes.
@@ -907,166 +965,9 @@ impl Config {
         }
     }
 
-    pub fn get_rendezvous_server() -> String {
-        let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
-        if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_option("custom-rendezvous-server");
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
-        }
-        if rendezvous_server.is_empty() {
-            rendezvous_server = Self::get_rendezvous_servers()
-                .drain(..)
-                .next()
-                .unwrap_or_default();
-        }
-        if !rendezvous_server.contains(':') {
-            rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
-        }
-        rendezvous_server
-    }
-
-    pub fn get_rendezvous_servers() -> Vec<String> {
-        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
-        if !s.is_empty() {
-            return vec![s];
-        }
-        let s = Self::get_option("custom-rendezvous-server");
-        if !s.is_empty() {
-            return vec![s];
-        }
-        let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
-        if !s.is_empty() {
-            return vec![s];
-        }
-        let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
-        if serial_obsolute {
-            let ss: Vec<String> = Self::get_option("rendezvous-servers")
-                .split(',')
-                .filter(|x| x.contains('.'))
-                .map(|x| x.to_owned())
-                .collect();
-            if !ss.is_empty() {
-                return ss;
-            }
-        }
-        return RENDEZVOUS_SERVERS.iter().map(|x| x.to_string()).collect();
-    }
-
-    pub fn reset_online() {
-        *ONLINE.lock().unwrap() = Default::default();
-    }
-
-    pub fn update_latency(host: &str, latency: i64) {
-        ONLINE.lock().unwrap().insert(host.to_owned(), latency);
-        let mut host = "".to_owned();
-        let mut delay = i64::MAX;
-        for (tmp_host, tmp_delay) in ONLINE.lock().unwrap().iter() {
-            if tmp_delay > &0 && tmp_delay < &delay {
-                delay = *tmp_delay;
-                host = tmp_host.to_string();
-            }
-        }
-        if !host.is_empty() {
-            let mut config = CONFIG2.write().unwrap();
-            if host != config.rendezvous_server {
-                log::debug!("Update rendezvous_server in config to {}", host);
-                log::debug!("{:?}", *ONLINE.lock().unwrap());
-                config.rendezvous_server = host;
-                config.store();
-            }
-        }
-    }
-
     pub fn set_id(id: &str) {
-        let mut config = CONFIG.write().unwrap();
-        if id == config.id {
-            return;
-        }
-        config.id = id.into();
-        config.store();
-    }
-
-    pub fn set_nat_type(nat_type: i32) {
-        let mut config = CONFIG2.write().unwrap();
-        if nat_type == config.nat_type {
-            return;
-        }
-        config.nat_type = nat_type;
-        config.store();
-    }
-
-    pub fn get_nat_type() -> i32 {
-        CONFIG2.read().unwrap().nat_type
-    }
-
-    pub fn set_serial(serial: i32) {
-        let mut config = CONFIG2.write().unwrap();
-        if serial == config.serial {
-            return;
-        }
-        config.serial = serial;
-        config.store();
-    }
-
-    pub fn get_serial() -> i32 {
-        std::cmp::max(CONFIG2.read().unwrap().serial, SERIAL)
-    }
-
-    #[cfg(any(target_os = "android", target_os = "ios"))]
-    fn gen_id() -> Option<String> {
-        Self::get_auto_id()
-    }
-
-    #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    fn gen_id() -> Option<String> {
-        let hostname_as_id = BUILTIN_SETTINGS
-            .read()
-            .unwrap()
-            .get(keys::OPTION_ALLOW_HOSTNAME_AS_ID)
-            .map(|v| option2bool(keys::OPTION_ALLOW_HOSTNAME_AS_ID, v))
-            .unwrap_or(false);
-        if hostname_as_id {
-            match whoami::fallible::hostname() {
-                Ok(h) => Some(h.replace(" ", "-")),
-                Err(e) => {
-                    log::warn!("Failed to get hostname, \"{}\", fallback to auto id", e);
-                    Self::get_auto_id()
-                }
-            }
-        } else {
-            Self::get_auto_id()
-        }
-    }
-
-    fn get_auto_id() -> Option<String> {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        {
-            return Some(
-                rand::thread_rng()
-                    .gen_range(1_000_000_000..2_000_000_000)
-                    .to_string(),
-            );
-        }
-
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
-        {
-            let mut id = 0u32;
-            if let Ok(Some(ma)) = mac_address::get_mac_address() {
-                for x in &ma.bytes()[2..] {
-                    id = (id << 8) | (*x as u32);
-                }
-                id &= 0x1FFFFFFF;
-                log::info!("Generated id {}", id);
-                Some(id.to_string())
-            } else {
-                None
-            }
-        }
+        let _ = id;
+        log::warn!("Ignored obsolete device ID update in LAN-only mode");
     }
 
     pub fn get_auto_password(length: usize) -> String {
@@ -1136,6 +1037,126 @@ impl Config {
         config.key_pair
     }
 
+    pub fn lan_credentials_configured() -> bool {
+        let config = CONFIG.read().unwrap();
+        !config.access_username.is_empty() && !config.access_password_hash.is_empty()
+    }
+
+    pub fn get_lan_access_username() -> String {
+        CONFIG.read().unwrap().access_username.clone()
+    }
+
+    pub fn get_credential_revision() -> u64 {
+        CONFIG.read().unwrap().credential_revision
+    }
+
+    pub fn get_lan_schema_version() -> u32 {
+        CONFIG.read().unwrap().lan_schema_version
+    }
+
+    pub fn get_trusted_lan_fingerprint(endpoint: &str) -> Option<String> {
+        CONFIG
+            .read()
+            .unwrap()
+            .trusted_lan_endpoints
+            .get(endpoint)
+            .cloned()
+    }
+
+    pub fn is_trusted_lan_fingerprint(fingerprint: &str) -> bool {
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        CONFIG
+            .read()
+            .unwrap()
+            .trusted_lan_endpoints
+            .values()
+            .any(|trusted| trusted == &fingerprint)
+    }
+
+    pub fn trust_lan_fingerprint(endpoint: &str, fingerprint: &str) -> Result<()> {
+        let endpoint = crate::lan::Endpoint::parse(endpoint)?
+            .authority()
+            .to_owned();
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid device fingerprint"));
+        }
+        let mut config = CONFIG.write().unwrap();
+        config
+            .trusted_lan_endpoints
+            .insert(endpoint, fingerprint.to_ascii_lowercase());
+        config.store();
+        Ok(())
+    }
+
+    pub fn forget_lan_fingerprint(endpoint: &str) -> Result<()> {
+        let endpoint = crate::lan::Endpoint::parse(endpoint)?
+            .authority()
+            .to_owned();
+        let mut config = CONFIG.write().unwrap();
+        if config.trusted_lan_endpoints.remove(&endpoint).is_some() {
+            config.store();
+        }
+        Ok(())
+    }
+
+    pub fn set_lan_credentials(username: &str, password: &[u8]) -> Result<u64> {
+        let username = crate::lan::validate_username(username)?;
+        let password_hash = hash_lan_password(password)?;
+
+        let mut config = CONFIG.write().unwrap();
+        config.access_username = username;
+        config.access_password_hash = password_hash;
+        config.credential_revision = config.credential_revision.saturating_add(1).max(1);
+        config.lan_schema_version = 1;
+        let revision = config.credential_revision;
+        config.store();
+        Ok(revision)
+    }
+
+    pub fn clear_lan_credentials() -> u64 {
+        let mut config = CONFIG.write().unwrap();
+        config.access_username.clear();
+        config.access_password_hash.clear();
+        config.credential_revision = config.credential_revision.saturating_add(1).max(1);
+        config.lan_schema_version = 1;
+        let revision = config.credential_revision;
+        config.store();
+        revision
+    }
+
+    pub fn verify_lan_credentials(username: &str, password: &[u8]) -> Result<bool> {
+        let (stored_username, stored_password_hash) = {
+            let config = CONFIG.read().unwrap();
+            (
+                config.access_username.clone(),
+                config.access_password_hash.clone(),
+            )
+        };
+        Self::verify_lan_credentials_against(
+            &stored_username,
+            &stored_password_hash,
+            username,
+            password,
+        )
+    }
+
+    fn verify_lan_credentials_against(
+        stored_username: &str,
+        stored_password_hash: &str,
+        username: &str,
+        password: &[u8],
+    ) -> Result<bool> {
+        let username = crate::lan::validate_username(username)?;
+        crate::lan::validate_password(password)?;
+        if stored_username.is_empty() || stored_password_hash.is_empty() {
+            return Ok(false);
+        }
+        let username_matches =
+            sodiumoxide::utils::memcmp(username.as_bytes(), stored_username.as_bytes());
+        let password_matches = verify_lan_password_hash(stored_password_hash, password)?;
+        Ok(username_matches && password_matches)
+    }
+
     pub fn get_cached_pk() -> Option<Vec<u8>> {
         KEY_PAIR.lock().unwrap().clone().map(|k| k.1)
     }
@@ -1198,22 +1219,15 @@ impl Config {
     }
 
     pub fn get_id() -> String {
-        let mut id = CONFIG.read().unwrap().id.clone();
-        if id.is_empty() {
-            if let Some(tmp) = Config::gen_id() {
-                id = tmp;
-                Config::set_id(&id);
-            }
-        }
-        id
+        crate::lan::device_fingerprint(&Self::get_key_pair().1)
     }
 
     pub fn get_id_or(b: String) -> String {
-        let a = CONFIG.read().unwrap().id.clone();
-        if a.is_empty() {
+        let fingerprint = Self::get_id();
+        if fingerprint.is_empty() {
             b
         } else {
-            a
+            fingerprint
         }
     }
 
@@ -1221,6 +1235,7 @@ impl Config {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
+        res.retain(|key, _| !is_lan_only_obsolete_option(key));
         res
     }
 
@@ -1231,6 +1246,7 @@ impl Config {
 
     pub fn set_options(mut v: HashMap<String, String>) {
         Self::purify_options(&mut v);
+        v.retain(|key, _| !is_lan_only_obsolete_option(key));
         let mut config = CONFIG2.write().unwrap();
         if config.options == v {
             return;
@@ -1240,6 +1256,9 @@ impl Config {
     }
 
     pub fn get_option(k: &str) -> String {
+        if is_lan_only_obsolete_option(k) {
+            return String::new();
+        }
         get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
@@ -1254,6 +1273,14 @@ impl Config {
     }
 
     pub fn set_option(k: String, v: String) {
+        if is_lan_only_obsolete_option(&k) {
+            let mut config = CONFIG2.write().unwrap();
+            if config.options.remove(&k).is_some() {
+                config.store();
+            }
+            log::warn!("Ignored obsolete LAN-only option: {k}");
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -1274,12 +1301,7 @@ impl Config {
     }
 
     pub fn update_id() {
-        // to-do: how about if one ip register a lot of ids?
-        let id = Self::get_id();
-        let mut rng = rand::thread_rng();
-        let new_id = rng.gen_range(1_000_000_000..2_000_000_000).to_string();
-        Config::set_id(&new_id);
-        log::info!("id updated from {} to {}", id, new_id);
+        log::warn!("Ignored obsolete device ID rotation in LAN-only mode");
     }
 
     /// Sets the local permanent password.
@@ -1315,7 +1337,6 @@ impl Config {
         }
         config.password = stored;
         config.store();
-        Self::clear_trusted_devices();
         true
     }
 
@@ -1351,7 +1372,6 @@ impl Config {
         }
 
         config.store();
-        Self::clear_trusted_devices();
         Ok(true)
     }
 
@@ -1470,106 +1490,6 @@ impl Config {
         salt
     }
 
-    pub fn set_socks(socks: Option<Socks5Server>) {
-        if OVERWRITE_SETTINGS
-            .read()
-            .unwrap()
-            .contains_key(keys::OPTION_PROXY_URL)
-        {
-            return;
-        }
-
-        let mut config = CONFIG2.write().unwrap();
-        if config.socks == socks {
-            return;
-        }
-        if config.socks.is_none() {
-            let equal_to_default = |key: &str, value: &str| {
-                DEFAULT_SETTINGS
-                    .read()
-                    .unwrap()
-                    .get(key)
-                    .map_or(false, |x| *x == value)
-            };
-            let contains_url = DEFAULT_SETTINGS
-                .read()
-                .unwrap()
-                .get(keys::OPTION_PROXY_URL)
-                .is_some();
-            let url = equal_to_default(
-                keys::OPTION_PROXY_URL,
-                &socks.clone().unwrap_or_default().proxy,
-            );
-            let username = equal_to_default(
-                keys::OPTION_PROXY_USERNAME,
-                &socks.clone().unwrap_or_default().username,
-            );
-            let password = equal_to_default(
-                keys::OPTION_PROXY_PASSWORD,
-                &socks.clone().unwrap_or_default().password,
-            );
-            if contains_url && url && username && password {
-                return;
-            }
-        }
-        config.socks = socks;
-        config.store();
-    }
-
-    #[inline]
-    fn get_socks_from_custom_client_advanced_settings(
-        settings: &HashMap<String, String>,
-    ) -> Option<Socks5Server> {
-        let url = settings.get(keys::OPTION_PROXY_URL)?;
-        Some(Socks5Server {
-            proxy: url.to_owned(),
-            username: settings
-                .get(keys::OPTION_PROXY_USERNAME)
-                .map(|x| x.to_string())
-                .unwrap_or_default(),
-            password: settings
-                .get(keys::OPTION_PROXY_PASSWORD)
-                .map(|x| x.to_string())
-                .unwrap_or_default(),
-        })
-    }
-
-    pub fn get_socks() -> Option<Socks5Server> {
-        Self::get_socks_from_custom_client_advanced_settings(&OVERWRITE_SETTINGS.read().unwrap())
-            .or(CONFIG2.read().unwrap().socks.clone())
-            .or(Self::get_socks_from_custom_client_advanced_settings(
-                &DEFAULT_SETTINGS.read().unwrap(),
-            ))
-    }
-
-    #[inline]
-    pub fn is_proxy() -> bool {
-        Self::get_network_type() != NetworkType::Direct
-    }
-
-    pub fn get_network_type() -> NetworkType {
-        if OVERWRITE_SETTINGS
-            .read()
-            .unwrap()
-            .get(keys::OPTION_PROXY_URL)
-            .is_some()
-        {
-            return NetworkType::ProxySocks;
-        }
-        if CONFIG2.read().unwrap().socks.is_some() {
-            return NetworkType::ProxySocks;
-        }
-        if DEFAULT_SETTINGS
-            .read()
-            .unwrap()
-            .get(keys::OPTION_PROXY_URL)
-            .is_some()
-        {
-            return NetworkType::ProxySocks;
-        }
-        NetworkType::Direct
-    }
-
     pub fn get_unlock_pin() -> String {
         if Self::is_disable_unlock_pin() {
             return String::new();
@@ -1589,71 +1509,14 @@ impl Config {
         config.store();
     }
 
-    pub fn get_trusted_devices_json() -> String {
-        serde_json::to_string(&Self::get_trusted_devices()).unwrap_or_default()
-    }
-
-    pub fn get_trusted_devices() -> Vec<TrustedDevice> {
-        let (devices, synced) = TRUSTED_DEVICES.read().unwrap().clone();
-        if synced {
-            return devices;
-        }
-        let devices = CONFIG2.read().unwrap().trusted_devices.clone();
-        let (devices, succ, store) = decrypt_str_or_original(&devices, PASSWORD_ENC_VERSION);
-        if succ {
-            let mut devices: Vec<TrustedDevice> =
-                serde_json::from_str(&devices).unwrap_or_default();
-            let len = devices.len();
-            devices.retain(|d| !d.outdate());
-            if store || devices.len() != len {
-                Self::set_trusted_devices(devices.clone());
-            }
-            *TRUSTED_DEVICES.write().unwrap() = (devices.clone(), true);
-            devices
-        } else {
-            Default::default()
-        }
-    }
-
-    fn set_trusted_devices(mut trusted_devices: Vec<TrustedDevice>) {
-        trusted_devices.retain(|d| !d.outdate());
-        let devices = serde_json::to_string(&trusted_devices).unwrap_or_default();
-        let max_len = 1024 * 1024;
-        if devices.bytes().len() > max_len {
-            log::error!("Trusted devices too large: {}", devices.bytes().len());
-            return;
-        }
-        let devices = encrypt_str_or_original(&devices, PASSWORD_ENC_VERSION, max_len);
-        let mut config = CONFIG2.write().unwrap();
-        config.trusted_devices = devices;
-        config.store();
-        *TRUSTED_DEVICES.write().unwrap() = (trusted_devices, true);
-    }
-
-    pub fn add_trusted_device(device: TrustedDevice) {
-        let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| d.hwid != device.hwid);
-        devices.push(device);
-        Self::set_trusted_devices(devices);
-    }
-
-    pub fn remove_trusted_devices(hwids: &Vec<Bytes>) {
-        let mut devices = Self::get_trusted_devices();
-        devices.retain(|d| !hwids.contains(&d.hwid));
-        Self::set_trusted_devices(devices);
-    }
-
-    pub fn clear_trusted_devices() {
-        Self::set_trusted_devices(Default::default());
-    }
-
     pub fn get() -> Config {
         return CONFIG.read().unwrap().clone();
     }
 
     // TODO: `Config::set()` does not invalidate trusted devices when permanent password/salt changes.
     // This matches historical behavior, but may need revisiting in a separate PR.
-    pub fn set(cfg: Config) -> bool {
+    pub fn set(mut cfg: Config) -> bool {
+        cfg.sanitize_lan_only();
         let mut lock = CONFIG.write().unwrap();
         if *lock == cfg {
             return false;
@@ -2121,6 +1984,22 @@ serde_field_bool!(
     "SyncInitClipboard::default_sync_init_clipboard"
 );
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct RecentLanEndpoint {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub endpoint: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub username: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub hostname: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub platform: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub fingerprint: String,
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub last_connected_at: i64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LocalConfig {
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -2133,12 +2012,37 @@ pub struct LocalConfig {
     pub fav: Vec<String>,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     options: HashMap<String, String>,
+    #[serde(default)]
+    recent_lan_endpoints: HashMap<String, RecentLanEndpoint>,
     // Various data for flutter ui
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     ui_flutter: HashMap<String, String>,
 }
 
 impl LocalConfig {
+    fn upsert_recent_lan_endpoint(&mut self, recent: RecentLanEndpoint) {
+        self.remote_id = recent.endpoint.clone();
+        self.recent_lan_endpoints
+            .insert(recent.fingerprint.clone(), recent);
+    }
+
+    fn sorted_recent_lan_endpoints(&self) -> Vec<RecentLanEndpoint> {
+        let mut recent: Vec<_> = self.recent_lan_endpoints.values().cloned().collect();
+        recent.sort_by(|a, b| b.last_connected_at.cmp(&a.last_connected_at));
+        recent
+    }
+
+    fn remove_recent_lan_endpoint_entry(&mut self, endpoint_or_fingerprint: &str) -> bool {
+        let removed = self
+            .recent_lan_endpoints
+            .remove(&endpoint_or_fingerprint.to_ascii_lowercase())
+            .is_some();
+        let before = self.recent_lan_endpoints.len();
+        self.recent_lan_endpoints
+            .retain(|_, recent| recent.endpoint != endpoint_or_fingerprint);
+        removed || before != self.recent_lan_endpoints.len()
+    }
+
     fn load() -> LocalConfig {
         Config::load_::<LocalConfig>("_local")
     }
@@ -2155,6 +2059,45 @@ impl LocalConfig {
         let mut config = LOCAL_CONFIG.write().unwrap();
         config.kb_layout_type = kb_layout_type;
         config.store();
+    }
+
+    pub fn record_recent_lan_endpoint(
+        endpoint: &str,
+        username: &str,
+        hostname: &str,
+        platform: &str,
+        fingerprint: &str,
+    ) -> Result<()> {
+        let endpoint = crate::lan::Endpoint::parse(endpoint)?
+            .authority()
+            .to_owned();
+        let username = crate::lan::validate_username(username)?;
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid device fingerprint"));
+        }
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: endpoint.clone(),
+            username,
+            hostname: hostname.trim().to_owned(),
+            platform: platform.trim().to_owned(),
+            fingerprint,
+            last_connected_at: crate::get_time(),
+        });
+        config.store();
+        Ok(())
+    }
+
+    pub fn get_recent_lan_endpoints() -> Vec<RecentLanEndpoint> {
+        LOCAL_CONFIG.read().unwrap().sorted_recent_lan_endpoints()
+    }
+
+    pub fn remove_recent_lan_endpoint(endpoint_or_fingerprint: &str) {
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        if config.remove_recent_lan_endpoint_entry(endpoint_or_fingerprint) {
+            config.store();
+        }
     }
 
     pub fn get_size() -> Size {
@@ -2285,13 +2228,22 @@ pub struct DiscoveryPeer {
     pub platform: String,
     #[serde(default, deserialize_with = "deserialize_bool")]
     pub online: bool,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub endpoint: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub fingerprint: String,
+    // TOML tables must follow scalar values when serialized by toml 0.5.
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     pub ip_mac: HashMap<String, String>,
 }
 
 impl DiscoveryPeer {
     pub fn is_same_peer(&self, other: &DiscoveryPeer) -> bool {
-        self.id == other.id && self.username == other.username
+        if !self.fingerprint.is_empty() && !other.fingerprint.is_empty() {
+            self.fingerprint == other.fingerprint
+        } else {
+            self.id == other.id && self.username == other.username
+        }
     }
 }
 
@@ -2704,25 +2656,12 @@ impl Group {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize, Clone)]
-pub struct TrustedDevice {
-    pub hwid: Bytes,
-    pub time: i64,
-    pub id: String,
-    pub name: String,
-    pub platform: String,
-}
-
-impl TrustedDevice {
-    pub fn outdate(&self) -> bool {
-        const DAYS_90: i64 = 90 * 24 * 60 * 60 * 1000;
-        self.time + DAYS_90 < crate::get_time()
-    }
-}
-
 deserialize_default!(deserialize_string, String);
 deserialize_default!(deserialize_bool, bool);
 deserialize_default!(deserialize_i32, i32);
+deserialize_default!(deserialize_i64, i64);
+deserialize_default!(deserialize_u32, u32);
+deserialize_default!(deserialize_u64, u64);
 deserialize_default!(deserialize_vec_u8, Vec<u8>);
 deserialize_default!(deserialize_vec_string, Vec<String>);
 deserialize_default!(deserialize_vec_i32_string_i32, Vec<(i32, String, i32)>);
@@ -2867,6 +2806,7 @@ pub mod keys {
     pub const OPTION_CODEC_PREFERENCE: &str = "codec-preference";
     pub const OPTION_LANGUAGE: &str = "lang";
     pub const OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD: &str = "allow-numeric-one-time-password";
+    pub const OPTION_ENABLE_LAN_DISCOVERY: &str = "lan-discovery-enabled";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
@@ -2941,6 +2881,156 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn lan_only_sanitizer_removes_legacy_identity_and_authentication() {
+        let mut config = Config {
+            id: "123456789".to_owned(),
+            enc_id: "legacy-id".to_owned(),
+            password: "legacy-password".to_owned(),
+            salt: "legacy-salt".to_owned(),
+            key_confirmed: true,
+            keys_confirmed: HashMap::from([("server".to_owned(), true)]),
+            ..Default::default()
+        };
+        assert!(config.sanitize_lan_only());
+        assert!(config.id.is_empty());
+        assert!(config.enc_id.is_empty());
+        assert!(config.password.is_empty());
+        assert!(config.salt.is_empty());
+        assert!(!config.key_confirmed);
+        assert!(config.keys_confirmed.is_empty());
+        assert_eq!(config.lan_schema_version, LAN_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn lan_only_sanitizer_removes_public_network_options() {
+        let mut config = Config2 {
+            rendezvous_server: "public.example".to_owned(),
+            nat_type: 2,
+            trusted_devices: "legacy".to_owned(),
+            socks: Some(Socks5Server::default()),
+            options: HashMap::from([
+                ("relay-server".to_owned(), "relay.example".to_owned()),
+                ("view_style".to_owned(), "original".to_owned()),
+            ]),
+            ..Default::default()
+        };
+        assert!(config.sanitize_lan_only());
+        assert!(config.rendezvous_server.is_empty());
+        assert_eq!(config.nat_type, 0);
+        assert!(config.trusted_devices.is_empty());
+        assert!(config.socks.is_none());
+        assert!(!config.options.contains_key("relay-server"));
+        assert_eq!(
+            config.options.get("view_style").map(String::as_str),
+            Some("original")
+        );
+    }
+
+    #[test]
+    fn lan_argon2_hash_accepts_only_the_original_password() {
+        let hash = hash_lan_password(b"correct horse battery staple").unwrap();
+        assert!(hash.starts_with("$argon2id$v=19$"));
+        assert!(verify_lan_password_hash(&hash, b"correct horse battery staple").unwrap());
+        assert!(!verify_lan_password_hash(&hash, b"wrong password").unwrap());
+        assert!(verify_lan_password_hash("not-a-phc-hash", b"password").is_err());
+        assert!(Config::verify_lan_credentials_against(
+            "operator",
+            &hash,
+            "operator",
+            b"correct horse battery staple"
+        )
+        .unwrap());
+        assert!(!Config::verify_lan_credentials_against(
+            "operator",
+            &hash,
+            "other-user",
+            b"correct horse battery staple"
+        )
+        .unwrap());
+        assert!(
+            Config::verify_lan_credentials_against("operator", &hash, "", b"password").is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lan_credentials_store_hash_only_with_owner_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let marker = "lan-storage-plaintext-marker";
+        let mut config = Config::default();
+        config.access_username = "operator".to_owned();
+        config.access_password_hash = hash_lan_password(marker.as_bytes()).unwrap();
+        config.credential_revision = 1;
+        config.lan_schema_version = LAN_SCHEMA_VERSION;
+        let path = std::env::temp_dir().join(format!(
+            "rustdesk-lan-config-{}-{}.toml",
+            std::process::id(),
+            crate::get_time()
+        ));
+
+        store_path(path.clone(), &config).unwrap();
+        let stored = fs::read_to_string(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        fs::remove_file(&path).unwrap();
+
+        assert!(!stored.contains(marker));
+        assert!(stored.contains("$argon2id$v=19$"));
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn recent_lan_endpoints_follow_stable_fingerprint_when_address_changes() {
+        let fingerprint = "a".repeat(64);
+        let mut config = LocalConfig::default();
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.20:21118".to_owned(),
+            username: "operator".to_owned(),
+            fingerprint: fingerprint.clone(),
+            last_connected_at: 1,
+            ..Default::default()
+        });
+        config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+            endpoint: "192.168.1.99:21118".to_owned(),
+            username: "operator".to_owned(),
+            fingerprint: fingerprint.clone(),
+            last_connected_at: 2,
+            ..Default::default()
+        });
+
+        assert_eq!(config.recent_lan_endpoints.len(), 1);
+        assert_eq!(config.remote_id, "192.168.1.99:21118");
+        assert_eq!(
+            config.recent_lan_endpoints[&fingerprint].endpoint,
+            "192.168.1.99:21118"
+        );
+    }
+
+    #[test]
+    fn recent_lan_endpoints_sort_and_remove_by_endpoint_or_fingerprint() {
+        let first_fingerprint = "a".repeat(64);
+        let second_fingerprint = "b".repeat(64);
+        let mut config = LocalConfig::default();
+        for (endpoint, fingerprint, last_connected_at) in [
+            ("host-a.lan:21118", first_fingerprint.clone(), 10),
+            ("host-b.lan:21118", second_fingerprint.clone(), 20),
+        ] {
+            config.upsert_recent_lan_endpoint(RecentLanEndpoint {
+                endpoint: endpoint.to_owned(),
+                fingerprint,
+                last_connected_at,
+                ..Default::default()
+            });
+        }
+
+        let sorted = config.sorted_recent_lan_endpoints();
+        assert_eq!(sorted[0].endpoint, "host-b.lan:21118");
+        assert!(config.remove_recent_lan_endpoint_entry("host-a.lan:21118"));
+        assert!(config.remove_recent_lan_endpoint_entry(&second_fingerprint));
+        assert!(config.recent_lan_endpoints.is_empty());
+    }
 
     struct ConfigStateTestGuard {
         original_config: Config,
@@ -3165,63 +3255,6 @@ mod tests {
     }
 
     #[test]
-    fn test_set_does_not_validate_or_decrypt_permanent_password_storage_in_memory() {
-        let mut cfg = Config::default();
-        let invalid_payload =
-            crate::password_security::symmetric_crypt(b"not-a-hash", true).unwrap();
-        let invalid_storage = PERMANENT_PASSWORD_ENC_VERSION.to_owned()
-            + &base64::encode(invalid_payload, base64::Variant::Original);
-        cfg.password = invalid_storage.clone();
-        cfg.id = "123456789".to_owned();
-
-        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
-            assert!(Config::set(cfg));
-
-            let updated = Config::get();
-            assert_eq!(updated.password, invalid_storage);
-            assert!(updated.salt.is_empty());
-            assert_eq!(updated.id, "123456789");
-        });
-    }
-
-    #[test]
-    fn test_store_keeps_existing_enc_id_when_id_is_unchanged() {
-        let mut cfg = Config::default();
-        cfg.id = "123456789".to_owned();
-        cfg.enc_id = encrypt_str_or_original(&cfg.id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        let original_enc_id = cfg.enc_id.clone();
-
-        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
-            assert!(Config::set(cfg));
-
-            assert_eq!(Config::load().enc_id, original_enc_id);
-            assert_eq!(Config::get().id, "123456789");
-        });
-    }
-
-    #[test]
-    fn test_store_rewrites_enc_id_when_id_changes() {
-        let original_id = "123456789";
-        let updated_id = "987654321";
-        let mut cfg = Config::default();
-        cfg.id = updated_id.to_owned();
-        let original_enc_id =
-            encrypt_str_or_original(original_id, PASSWORD_ENC_VERSION, ENCRYPT_MAX_LEN);
-        cfg.enc_id = original_enc_id.clone();
-
-        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
-            assert!(Config::set(cfg));
-
-            let stored = Config::load().enc_id;
-            let (stored_id, encrypted, _) = decrypt_str_or_original(&stored, PASSWORD_ENC_VERSION);
-            assert_ne!(stored, original_enc_id);
-            assert!(encrypted);
-            assert_eq!(stored_id, updated_id);
-            assert_eq!(Config::get().id, updated_id);
-        });
-    }
-
-    #[test]
     fn test_config2_store_keeps_existing_unlock_pin_when_pin_is_unchanged() {
         let _guard = CONFIG_STATE_TEST_LOCK.lock().unwrap();
         let _file_guard = ConfigFileRestoreGuard::new(Config::file_("2"));
@@ -3243,37 +3276,6 @@ mod tests {
 
         let stored = Config::load_::<Config2>("2");
         assert_eq!(stored.unlock_pin, original_unlock_pin);
-    }
-
-    #[test]
-    fn test_set_does_not_convert_plaintext_permanent_password_to_storage_format_in_memory() {
-        let mut cfg = Config::default();
-        cfg.password = "legacy-secret".to_owned();
-        cfg.salt = "".to_owned();
-
-        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
-            assert!(Config::set(cfg));
-
-            let updated = Config::get();
-            assert!(!updated.password.starts_with(PASSWORD_ENC_VERSION));
-            assert_eq!(updated.password, "legacy-secret");
-            assert!(updated.salt.is_empty());
-        });
-    }
-
-    #[test]
-    fn test_set_keeps_plaintext_permanent_password_with_current_prefix_in_memory() {
-        let mut cfg = Config::default();
-        cfg.password = "01legacy-secret".to_owned();
-        cfg.salt = "".to_owned();
-
-        with_config_and_hard_settings(Config::default(), HashMap::new(), || {
-            assert!(Config::set(cfg));
-
-            let updated = Config::get();
-            assert_eq!(updated.password, "01legacy-secret");
-            assert!(updated.salt.is_empty());
-        });
     }
 
     #[test]

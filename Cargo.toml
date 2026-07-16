@@ -50,6 +50,7 @@ url = "2.5"
 percent-encoding = "2"
 sha2 = "0.10"
 whoami = "1.5"
+argon2 = { version = "0.5", features = ["std"] }
 
 tokio-rustls = { version = "0.26", features = [
     "logging",
