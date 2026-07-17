@@ -1268,6 +1268,16 @@ impl Config {
         .unwrap_or_default()
     }
 
+    /// Reads an option from persisted configuration instead of this process's
+    /// startup-time snapshot. This is used by long-lived companion processes.
+    pub fn get_option_from_file(k: &str) -> String {
+        if is_lan_only_obsolete_option(k) {
+            return String::new();
+        }
+        let config = Config2::load();
+        get_or(&OVERWRITE_SETTINGS, &config.options, &DEFAULT_SETTINGS, k).unwrap_or_default()
+    }
+
     pub fn get_bool_option(k: &str) -> bool {
         option2bool(k, &Self::get_option(k))
     }
@@ -2138,6 +2148,14 @@ impl LocalConfig {
 
     pub fn get_fav() -> Vec<String> {
         LOCAL_CONFIG.read().unwrap().fav.clone()
+    }
+
+    /// Loads favorites and LAN peer metadata directly from disk so another
+    /// desktop process can observe changes made by the Flutter UI.
+    pub fn load_fav_with_recent_lan_endpoints() -> (Vec<String>, Vec<RecentLanEndpoint>) {
+        let config = Self::load();
+        let recent = config.sorted_recent_lan_endpoints();
+        (config.fav, recent)
     }
 
     pub fn get_option(k: &str) -> String {
