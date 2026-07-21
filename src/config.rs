@@ -2874,6 +2874,8 @@ pub mod keys {
     pub const OPTION_WEB_ACCESS_ENABLED: &str = "web-access-enabled";
     pub const OPTION_WEB_LISTEN_PORT: &str = "web-listen-port";
     pub const OPTION_WEB_HTTPS_ENABLED: &str = "web-https-enabled";
+    pub const OPTION_WEB_CERTIFICATE_PATH: &str = "web-certificate-path";
+    pub const OPTION_WEB_PRIVATE_KEY_PATH: &str = "web-private-key-path";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_DIRECT_ACCESS_PORT: &str = "direct-access-port";
     pub const OPTION_WHITELIST: &str = "whitelist";
