@@ -2827,6 +2827,9 @@ pub mod keys {
     pub const OPTION_LANGUAGE: &str = "lang";
     pub const OPTION_ALLOW_NUMERNIC_ONE_TIME_PASSWORD: &str = "allow-numeric-one-time-password";
     pub const OPTION_ENABLE_LAN_DISCOVERY: &str = "lan-discovery-enabled";
+    pub const OPTION_WEB_ACCESS_ENABLED: &str = "web-access-enabled";
+    pub const OPTION_WEB_LISTEN_PORT: &str = "web-listen-port";
+    pub const OPTION_WEB_HTTPS_ENABLED: &str = "web-https-enabled";
     pub const OPTION_DIRECT_SERVER: &str = "direct-server";
     pub const OPTION_ALLOW_WEBSOCKET: &str = "allow-websocket";
     pub const OPTION_TRACKPAD_SPEED: &str = "trackpad-speed";
