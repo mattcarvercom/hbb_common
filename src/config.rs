@@ -2010,6 +2010,20 @@ pub struct RecentLanEndpoint {
     pub last_connected_at: i64,
 }
 
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct LanIdentity {
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub id: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub name: String,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    pub username: String,
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub created_at: i64,
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize, Clone)]
 pub struct LocalConfig {
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -2020,10 +2034,16 @@ pub struct LocalConfig {
     size: Size,
     #[serde(default, deserialize_with = "deserialize_vec_string")]
     pub fav: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_string")]
+    default_lan_identity_id: String,
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     options: HashMap<String, String>,
     #[serde(default)]
     recent_lan_endpoints: HashMap<String, RecentLanEndpoint>,
+    #[serde(default)]
+    lan_identities: HashMap<String, LanIdentity>,
+    #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
+    lan_identity_bindings: HashMap<String, String>,
     // Various data for flutter ui
     #[serde(default, deserialize_with = "deserialize_hashmap_string_string")]
     ui_flutter: HashMap<String, String>,
@@ -2043,6 +2063,15 @@ impl LocalConfig {
     }
 
     fn remove_recent_lan_endpoint_entry(&mut self, endpoint_or_fingerprint: &str) -> bool {
+        let removed_fingerprints = self
+            .recent_lan_endpoints
+            .iter()
+            .filter_map(|(fingerprint, recent)| {
+                (fingerprint.eq_ignore_ascii_case(endpoint_or_fingerprint)
+                    || recent.endpoint == endpoint_or_fingerprint)
+                    .then(|| fingerprint.clone())
+            })
+            .collect::<Vec<_>>();
         let removed = self
             .recent_lan_endpoints
             .remove(&endpoint_or_fingerprint.to_ascii_lowercase())
@@ -2050,7 +2079,59 @@ impl LocalConfig {
         let before = self.recent_lan_endpoints.len();
         self.recent_lan_endpoints
             .retain(|_, recent| recent.endpoint != endpoint_or_fingerprint);
+        for fingerprint in &removed_fingerprints {
+            self.lan_identity_bindings.remove(fingerprint);
+        }
         removed || before != self.recent_lan_endpoints.len()
+    }
+
+    fn remove_lan_identity_entry(&mut self, identity_id: &str) -> bool {
+        if self.lan_identities.remove(identity_id).is_none() {
+            return false;
+        }
+        if self.default_lan_identity_id == identity_id {
+            self.default_lan_identity_id.clear();
+        }
+        self.lan_identity_bindings
+            .retain(|_, bound_identity_id| bound_identity_id != identity_id);
+        true
+    }
+
+    fn bind_lan_identity_entry(&mut self, fingerprint: &str, identity_id: &str) -> Result<bool> {
+        if fingerprint.len() != 64 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid device fingerprint"));
+        }
+        let fingerprint = fingerprint.to_ascii_lowercase();
+        if identity_id.is_empty() {
+            return Ok(self.lan_identity_bindings.remove(&fingerprint).is_some());
+        }
+        if !self.lan_identities.contains_key(identity_id) {
+            return Err(anyhow!("LAN identity does not exist"));
+        }
+        if self
+            .lan_identity_bindings
+            .get(&fingerprint)
+            .map(String::as_str)
+            == Some(identity_id)
+        {
+            return Ok(false);
+        }
+        self.lan_identity_bindings
+            .insert(fingerprint, identity_id.to_owned());
+        Ok(true)
+    }
+
+    fn resolve_lan_identity_entry(&self, fingerprint: &str) -> String {
+        self.lan_identity_bindings
+            .get(&fingerprint.to_ascii_lowercase())
+            .filter(|identity_id| self.lan_identities.contains_key(*identity_id))
+            .cloned()
+            .or_else(|| {
+                self.lan_identities
+                    .contains_key(&self.default_lan_identity_id)
+                    .then(|| self.default_lan_identity_id.clone())
+            })
+            .unwrap_or_default()
     }
 
     fn load() -> LocalConfig {
@@ -2108,6 +2189,95 @@ impl LocalConfig {
         if config.remove_recent_lan_endpoint_entry(endpoint_or_fingerprint) {
             config.store();
         }
+    }
+
+    pub fn get_lan_identities() -> Vec<LanIdentity> {
+        let config = LOCAL_CONFIG.read().unwrap();
+        let mut identities = config.lan_identities.values().cloned().collect::<Vec<_>>();
+        identities.sort_by(|a, b| {
+            a.name
+                .to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        identities
+    }
+
+    pub fn get_lan_identity(identity_id: &str) -> Option<LanIdentity> {
+        LOCAL_CONFIG
+            .read()
+            .unwrap()
+            .lan_identities
+            .get(identity_id)
+            .cloned()
+    }
+
+    pub fn lan_identity_name_exists(name: &str, excluding_id: Option<&str>) -> bool {
+        LOCAL_CONFIG
+            .read()
+            .unwrap()
+            .lan_identities
+            .values()
+            .any(|identity| {
+                Some(identity.id.as_str()) != excluding_id
+                    && identity.name.eq_ignore_ascii_case(name)
+            })
+    }
+
+    pub fn store_lan_identity(identity: LanIdentity) {
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        config.lan_identities.insert(identity.id.clone(), identity);
+        config.store();
+    }
+
+    pub fn remove_lan_identity(identity_id: &str) -> bool {
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        if !config.remove_lan_identity_entry(identity_id) {
+            return false;
+        }
+        config.store();
+        true
+    }
+
+    pub fn get_default_lan_identity_id() -> String {
+        LOCAL_CONFIG.read().unwrap().default_lan_identity_id.clone()
+    }
+
+    pub fn set_default_lan_identity_id(identity_id: &str) -> Result<()> {
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        if !identity_id.is_empty() && !config.lan_identities.contains_key(identity_id) {
+            return Err(anyhow!("LAN identity does not exist"));
+        }
+        if config.default_lan_identity_id != identity_id {
+            config.default_lan_identity_id = identity_id.to_owned();
+            config.store();
+        }
+        Ok(())
+    }
+
+    pub fn get_bound_lan_identity_id(fingerprint: &str) -> String {
+        let config = LOCAL_CONFIG.read().unwrap();
+        config
+            .lan_identity_bindings
+            .get(&fingerprint.to_ascii_lowercase())
+            .filter(|identity_id| config.lan_identities.contains_key(*identity_id))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn bind_lan_identity(fingerprint: &str, identity_id: &str) -> Result<()> {
+        let mut config = LOCAL_CONFIG.write().unwrap();
+        if config.bind_lan_identity_entry(fingerprint, identity_id)? {
+            config.store();
+        }
+        Ok(())
+    }
+
+    pub fn resolve_lan_identity_id(fingerprint: &str) -> String {
+        LOCAL_CONFIG
+            .read()
+            .unwrap()
+            .resolve_lan_identity_entry(fingerprint)
     }
 
     pub fn get_size() -> Size {
@@ -3393,9 +3563,93 @@ mod tests {
 
         let sorted = config.sorted_recent_lan_endpoints();
         assert_eq!(sorted[0].endpoint, "host-b.lan:21118");
+        config
+            .lan_identity_bindings
+            .insert(first_fingerprint.clone(), "identity-a".to_owned());
+        config
+            .lan_identity_bindings
+            .insert(second_fingerprint.clone(), "identity-b".to_owned());
         assert!(config.remove_recent_lan_endpoint_entry("host-a.lan:21118"));
+        assert!(!config
+            .lan_identity_bindings
+            .contains_key(&first_fingerprint));
         assert!(config.remove_recent_lan_endpoint_entry(&second_fingerprint));
         assert!(config.recent_lan_endpoints.is_empty());
+        assert!(config.lan_identity_bindings.is_empty());
+    }
+
+    #[test]
+    fn lan_identity_binding_overrides_default_and_falls_back_after_removal() {
+        let default_id = "11111111-1111-4111-8111-111111111111".to_owned();
+        let bound_id = "22222222-2222-4222-8222-222222222222".to_owned();
+        let fingerprint = "a".repeat(64);
+        let mut config = LocalConfig::default();
+        for (id, name) in [
+            (default_id.clone(), "Default operators"),
+            (bound_id.clone(), "Special operators"),
+        ] {
+            config.lan_identities.insert(
+                id.clone(),
+                LanIdentity {
+                    id,
+                    name: name.to_owned(),
+                    username: "operator".to_owned(),
+                    ..Default::default()
+                },
+            );
+        }
+        config.default_lan_identity_id = default_id.clone();
+
+        assert_eq!(config.resolve_lan_identity_entry(&fingerprint), default_id);
+        assert!(config
+            .bind_lan_identity_entry(&fingerprint, &bound_id)
+            .unwrap());
+        assert_eq!(config.resolve_lan_identity_entry(&fingerprint), bound_id);
+        assert!(config.remove_lan_identity_entry(&bound_id));
+        assert_eq!(
+            config.resolve_lan_identity_entry(&fingerprint),
+            config.default_lan_identity_id
+        );
+        assert!(config.remove_lan_identity_entry(&default_id));
+        assert!(config.resolve_lan_identity_entry(&fingerprint).is_empty());
+        assert!(config.default_lan_identity_id.is_empty());
+        assert!(config.lan_identity_bindings.is_empty());
+    }
+
+    #[test]
+    fn lan_identity_binding_rejects_invalid_targets() {
+        let mut config = LocalConfig::default();
+        assert!(config.bind_lan_identity_entry("short", "").is_err());
+        assert!(config
+            .bind_lan_identity_entry(&"b".repeat(64), "missing")
+            .is_err());
+    }
+
+    #[test]
+    fn lan_identity_metadata_roundtrip_contains_no_password_field() {
+        let identity_id = "33333333-3333-4333-8333-333333333333".to_owned();
+        let mut config = LocalConfig::default();
+        config.default_lan_identity_id = identity_id.clone();
+        config.lan_identities.insert(
+            identity_id.clone(),
+            LanIdentity {
+                id: identity_id,
+                name: "Operations".to_owned(),
+                username: "operator".to_owned(),
+                created_at: 10,
+                updated_at: 20,
+            },
+        );
+
+        let serialized = toml::to_string(&config).unwrap();
+        let decoded: LocalConfig = toml::from_str(&serialized).unwrap();
+
+        assert!(!serialized.to_lowercase().contains("password"));
+        assert_eq!(
+            decoded.default_lan_identity_id,
+            config.default_lan_identity_id
+        );
+        assert_eq!(decoded.lan_identities, config.lan_identities);
     }
 
     struct ConfigStateTestGuard {
