@@ -2416,6 +2416,12 @@ pub struct DiscoveryPeer {
     pub platform: String,
     #[serde(default, deserialize_with = "deserialize_bool")]
     pub online: bool,
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub last_seen: i64,
+    #[serde(default, deserialize_with = "deserialize_i64")]
+    pub last_checked: i64,
+    #[serde(default)]
+    pub missed_discoveries: u32,
     #[serde(default, deserialize_with = "deserialize_string")]
     pub endpoint: String,
     #[serde(default, deserialize_with = "deserialize_string")]
@@ -2426,9 +2432,51 @@ pub struct DiscoveryPeer {
 }
 
 impl DiscoveryPeer {
+    const STATUS_MAX_AGE_MS: i64 = 30_000;
+
+    /// Discovery is advisory: missing or stale evidence is not an offline result.
+    pub fn online_state(&self, now: i64) -> Option<bool> {
+        if self.last_seen <= 0
+            || self.last_seen > now
+            || self.last_checked < self.last_seen
+            || !(0..Self::STATUS_MAX_AGE_MS).contains(&(now - self.last_checked))
+        {
+            return None;
+        }
+        if self.online && self.missed_discoveries == 0 {
+            Some(true)
+        } else if self.missed_discoveries >= 3
+            && now - self.last_seen >= Self::STATUS_MAX_AGE_MS
+        {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    pub fn mark_seen(&mut self, now: i64) {
+        self.online = true;
+        self.last_seen = now;
+        self.last_checked = now;
+        self.missed_discoveries = 0;
+    }
+
+    pub fn mark_missed(&mut self, now: i64) {
+        // Do not count scans from before a long pause toward an offline result.
+        self.missed_discoveries = if (0..Self::STATUS_MAX_AGE_MS)
+            .contains(&now.saturating_sub(self.last_checked))
+        {
+            self.missed_discoveries.saturating_add(1)
+        } else {
+            1
+        };
+        self.online = false;
+        self.last_checked = now;
+    }
+
     pub fn is_same_peer(&self, other: &DiscoveryPeer) -> bool {
         if !self.fingerprint.is_empty() && !other.fingerprint.is_empty() {
-            self.fingerprint == other.fingerprint
+            self.fingerprint.eq_ignore_ascii_case(&other.fingerprint)
         } else {
             self.id == other.id && self.username == other.username
         }
@@ -3076,6 +3124,73 @@ mod tests {
     use super::{permanent_password::PERMANENT_PASSWORD_ENC_VERSION, *};
 
     static CONFIG_STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn discovery_legacy_cache_has_unknown_presence() {
+        let peer: DiscoveryPeer =
+            serde_json::from_str(r#"{"id":"old","online":true}"#).unwrap();
+        assert_eq!(peer.online_state(100_000), None);
+    }
+
+    #[test]
+    fn discovery_presence_expires_and_rejects_clock_rollback() {
+        let mut peer = DiscoveryPeer::default();
+        peer.mark_seen(100_000);
+        assert_eq!(peer.online_state(100_000), Some(true));
+        assert_eq!(peer.online_state(129_999), Some(true));
+        assert_eq!(peer.online_state(130_000), None);
+        assert_eq!(peer.online_state(99_999), None);
+        peer.last_checked = 0; // failed discovery must not leave a green badge
+        assert_eq!(peer.online_state(100_001), None);
+    }
+
+    #[test]
+    fn discovery_requires_repeated_misses_and_grace_before_offline() {
+        let mut peer = DiscoveryPeer::default();
+        peer.mark_seen(100_000);
+        for now in [108_000, 116_000, 124_000] {
+            peer.mark_missed(now);
+            assert_eq!(peer.online_state(now), None);
+        }
+        peer.mark_missed(132_000);
+        assert_eq!(peer.online_state(132_000), Some(false));
+        assert_eq!(peer.last_seen, 100_000);
+        assert_eq!(peer.online_state(162_000), None);
+        peer.mark_seen(163_000);
+        assert_eq!(peer.online_state(163_000), Some(true));
+        assert_eq!(peer.missed_discoveries, 0);
+    }
+
+    #[test]
+    fn discovery_pause_resets_consecutive_misses() {
+        let mut peer = DiscoveryPeer::default();
+        peer.mark_seen(100_000);
+        peer.mark_missed(110_000);
+        peer.mark_missed(120_000);
+        peer.mark_missed(200_000);
+        assert_eq!(peer.missed_discoveries, 1);
+        assert_eq!(peer.online_state(200_000), None);
+        peer.last_checked = i64::MIN;
+        peer.mark_missed(200_001);
+        assert_eq!(peer.missed_discoveries, 1);
+    }
+
+    #[test]
+    fn discovery_presence_survives_json_and_toml_storage() {
+        let mut peer = DiscoveryPeer {
+            id: "192.168.1.2:21118".to_owned(),
+            ip_mac: HashMap::from([("192.168.1.2".to_owned(), String::new())]),
+            ..Default::default()
+        };
+        peer.mark_seen(100_000);
+        let json = serde_json::to_value(&peer).unwrap();
+        assert_eq!(json["online"], true);
+        assert_eq!(json["last_seen"], 100_000);
+        let stored = toml::to_string(&LanPeers { peers: vec![peer] }).unwrap();
+        let loaded: LanPeers = toml::from_str(&stored).unwrap();
+        assert_eq!(loaded.peers[0].last_seen, 100_000);
+        assert_eq!(loaded.peers[0].online_state(100_001), Some(true));
+    }
 
     #[test]
     fn lan_only_sanitizer_removes_legacy_identity_and_authentication() {
