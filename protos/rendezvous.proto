@@ -33,7 +33,8 @@ message PunchHoleRequest {
 message ControlPermissions {
   enum Permission {
     keyboard = 0;
-    remote_printer = 1;
+    // Retained for wire compatibility with older clients. New clients ignore it.
+    remote_printer = 1 [deprecated = true];
     clipboard = 2;
     file = 3;
     audio = 4;

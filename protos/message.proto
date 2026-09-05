@@ -492,7 +492,8 @@ message FileTransferSendRequest {
 
   enum FileType {
     Generic = 0;
-    Printer = 1;
+    // Retained for wire compatibility with older clients. New clients ignore it.
+    Printer = 1 [deprecated = true];
   }
   FileType file_type = 5;
 }

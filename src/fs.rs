@@ -2,7 +2,6 @@
 use std::os::windows::prelude::*;
 use std::{
     fmt::{Debug, Display},
-    io::Cursor,
     path::{Path, PathBuf},
     sync::atomic::{AtomicI32, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -12,7 +11,7 @@ use serde_derive::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufStream as TokioBufStream},
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
 };
 
 use crate::{anyhow::anyhow, bail, get_version_number, message_proto::*, ResultType, Stream};
@@ -262,7 +261,6 @@ pub fn can_enable_overwrite_detection(version: i64) -> bool {
 #[derive(Copy, Clone, Serialize, Debug, PartialEq)]
 pub enum JobType {
     Generic = 0,
-    Printer = 1,
 }
 
 impl Default for JobType {
@@ -275,7 +273,6 @@ impl From<JobType> for file_transfer_send_request::FileType {
     fn from(t: JobType) -> Self {
         match t {
             JobType::Generic => file_transfer_send_request::FileType::Generic,
-            JobType::Printer => file_transfer_send_request::FileType::Printer,
         }
     }
 }
@@ -284,7 +281,6 @@ impl From<i32> for JobType {
     fn from(value: i32) -> Self {
         match value {
             0 => JobType::Generic,
-            1 => JobType::Printer,
             _ => JobType::Generic,
         }
     }
@@ -300,7 +296,6 @@ impl JobType {
     pub fn from_proto(t: ::protobuf::EnumOrUnknown<file_transfer_send_request::FileType>) -> Self {
         match t.enum_value() {
             Ok(file_transfer_send_request::FileType::Generic) => JobType::Generic,
-            Ok(file_transfer_send_request::FileType::Printer) => JobType::Printer,
             _ => JobType::Generic,
         }
     }
@@ -309,7 +304,6 @@ impl JobType {
 #[derive(Debug)]
 pub enum DataSource {
     FilePath(PathBuf),
-    MemoryCursor(Cursor<Vec<u8>>),
 }
 
 impl Default for DataSource {
@@ -325,7 +319,6 @@ impl serde::Serialize for DataSource {
     {
         match self {
             DataSource::FilePath(p) => serializer.serialize_str(p.to_str().unwrap_or("")),
-            DataSource::MemoryCursor(_) => serializer.serialize_str(""),
         }
     }
 }
@@ -334,7 +327,6 @@ impl Display for DataSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DataSource::FilePath(p) => write!(f, "File: {}", p.to_string_lossy().to_string()),
-            DataSource::MemoryCursor(_) => write!(f, "Bytes"),
         }
     }
 }
@@ -343,21 +335,18 @@ impl DataSource {
     fn to_meta(&self) -> String {
         match self {
             DataSource::FilePath(p) => p.to_string_lossy().to_string(),
-            DataSource::MemoryCursor(_) => "".to_string(),
         }
     }
 }
 
 enum DataStream {
     FileStream(File),
-    BufStream(TokioBufStream<Cursor<Vec<u8>>>),
 }
 
 impl Debug for DataStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DataStream::FileStream(fs) => write!(f, "{:?}", fs),
-            DataStream::BufStream(_) => write!(f, "BufStream"),
         }
     }
 }
@@ -366,7 +355,6 @@ impl DataStream {
     async fn write_all(&mut self, buf: &[u8]) -> ResultType<()> {
         match self {
             DataStream::FileStream(fs) => fs.write_all(buf).await?,
-            DataStream::BufStream(bs) => bs.write_all(buf).await?,
         }
         Ok(())
     }
@@ -374,7 +362,6 @@ impl DataStream {
     async fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             DataStream::FileStream(fs) => fs.read(buf).await,
-            DataStream::BufStream(bs) => bs.read(buf).await,
         }
     }
 }
@@ -603,15 +590,10 @@ impl TransferJob {
         enable_overwrite_detection: bool,
     ) -> ResultType<Self> {
         log::info!("new read {}", data_source);
-        let (files, total_size) = match &data_source {
-            DataSource::FilePath(p) => {
-                let p = p.to_str().ok_or(anyhow!("Invalid path"))?;
-                let files = get_recursive_files(p, show_hidden)?;
-                let total_size = files.iter().map(|x| x.size).sum();
-                (files, total_size)
-            }
-            DataSource::MemoryCursor(c) => (Vec::new(), c.get_ref().len() as u64),
-        };
+        let DataSource::FilePath(p) = &data_source;
+        let p = p.to_str().ok_or(anyhow!("Invalid path"))?;
+        let files = get_recursive_files(p, show_hidden)?;
+        let total_size = files.iter().map(|x| x.size).sum();
         Ok(Self {
             id,
             r#type,
@@ -627,16 +609,6 @@ impl TransferJob {
         })
     }
 
-    pub async fn get_buf_data(self) -> ResultType<Option<Vec<u8>>> {
-        match self.data_stream {
-            Some(DataStream::BufStream(mut bs)) => {
-                bs.flush().await?;
-                Ok(Some(bs.into_inner().into_inner()))
-            }
-            _ => Ok(None),
-        }
-    }
-
     #[inline]
     pub fn files(&self) -> &Vec<FileEntry> {
         &self.files
@@ -645,10 +617,9 @@ impl TransferJob {
     #[inline]
     pub fn set_files(&mut self, files: Vec<FileEntry>) -> ResultType<()> {
         validate_transfer_file_names(&files)?;
-        if let DataSource::FilePath(base) = &self.data_source {
-            for file in &files {
-                validate_no_symlink_components(base, &file.name)?;
-            }
+        let DataSource::FilePath(base) = &self.data_source;
+        for file in &files {
+            validate_no_symlink_components(base, &file.name)?;
         }
         self.total_size = files.iter().map(|x| x.size).sum();
         self.files = files;
@@ -687,59 +658,47 @@ impl TransferJob {
     }
 
     fn resolve_entry_path(&self, base: &PathBuf, name: &str) -> Option<PathBuf> {
-        if self.r#type == JobType::Generic {
-            match join_validated_path(base, name) {
-                Ok(path) => Some(path),
-                Err(err) => {
-                    log::error!("Invalid file name in transfer job {}: {}", self.id, err);
-                    None
-                }
+        match join_validated_path(base, name) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                log::error!("Invalid file name in transfer job {}: {}", self.id, err);
+                None
             }
-        } else {
-            Some(Self::join(base, name))
         }
     }
 
     pub fn modify_time(&self) {
-        if self.r#type == JobType::Printer {
-            return;
-        }
-        if let DataSource::FilePath(p) = &self.data_source {
-            let file_num = self.file_num as usize;
-            if file_num < self.files.len() {
-                let entry = &self.files[file_num];
-                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                    return;
-                };
-                let download_path = format!("{}.download", get_string(&path));
-                let digest_path = format!("{}.digest", get_string(&path));
-                std::fs::remove_file(digest_path).ok();
-                std::fs::rename(download_path, &path).ok();
-                filetime::set_file_mtime(
-                    &path,
-                    filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
-                )
-                .ok();
-            }
+        let DataSource::FilePath(p) = &self.data_source;
+        let file_num = self.file_num as usize;
+        if file_num < self.files.len() {
+            let entry = &self.files[file_num];
+            let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                return;
+            };
+            let download_path = format!("{}.download", get_string(&path));
+            let digest_path = format!("{}.digest", get_string(&path));
+            std::fs::remove_file(digest_path).ok();
+            std::fs::rename(download_path, &path).ok();
+            filetime::set_file_mtime(
+                &path,
+                filetime::FileTime::from_unix_time(entry.modified_time as _, 0),
+            )
+            .ok();
         }
     }
 
     pub fn remove_download_file(&self) {
-        if self.r#type == JobType::Printer {
-            return;
-        }
-        if let DataSource::FilePath(p) = &self.data_source {
-            let file_num = self.file_num as usize;
-            if file_num < self.files.len() {
-                let entry = &self.files[file_num];
-                let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                    return;
-                };
-                let download_path = format!("{}.download", get_string(&path));
-                let digest_path = format!("{}.digest", get_string(&path));
-                std::fs::remove_file(download_path).ok();
-                std::fs::remove_file(digest_path).ok();
-            }
+        let DataSource::FilePath(p) = &self.data_source;
+        let file_num = self.file_num as usize;
+        if file_num < self.files.len() {
+            let entry = &self.files[file_num];
+            let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+                return;
+            };
+            let download_path = format!("{}.download", get_string(&path));
+            let digest_path = format!("{}.digest", get_string(&path));
+            std::fs::remove_file(download_path).ok();
+            std::fs::remove_file(digest_path).ok();
         }
     }
 
@@ -773,37 +732,22 @@ impl TransferJob {
                     }
                     self.file_num = block.file_num;
                     let entry = &self.files[file_num];
-                    let (path, digest_path) = if self.r#type == JobType::Printer {
-                        (p.to_string_lossy().to_string(), None)
-                    } else {
-                        let path = join_validated_path(p, &entry.name)?;
-                        // NOTE: We intentionally keep path-based validation + regular file open here.
-                        // This still has a known TOCTOU window for symlink races, but avoids a large
-                        // cross-platform rewrite for now.
-                        // Revisit with descriptor/handle-based no-follow open in future hardening.
-                        if let Some(pp) = path.parent() {
-                            std::fs::create_dir_all(pp).ok();
-                        }
-                        let file_path = get_string(&path);
-                        (
-                            format!("{}.download", &file_path),
-                            Some(format!("{}.digest", &file_path)),
-                        )
-                    };
-                    if let Some(dp) = digest_path.as_ref() {
-                        if Path::new(dp).exists() {
-                            std::fs::remove_file(dp)?;
-                        }
+                    let path = join_validated_path(p, &entry.name)?;
+                    // NOTE: We intentionally keep path-based validation + regular file open here.
+                    // This still has a known TOCTOU window for symlink races, but avoids a large
+                    // cross-platform rewrite for now.
+                    // Revisit with descriptor/handle-based no-follow open in future hardening.
+                    if let Some(pp) = path.parent() {
+                        std::fs::create_dir_all(pp).ok();
+                    }
+                    let file_path = get_string(&path);
+                    let path = format!("{}.download", &file_path);
+                    let digest_path = format!("{}.digest", &file_path);
+                    if Path::new(&digest_path).exists() {
+                        std::fs::remove_file(&digest_path)?;
                     }
                     self.data_stream = Some(DataStream::FileStream(File::create(&path).await?));
-                    if let Some(dp) = digest_path.as_ref() {
-                        std::fs::write(dp, json!(self.digest).to_string()).ok();
-                    }
-                }
-            }
-            DataSource::MemoryCursor(c) => {
-                if self.data_stream.is_none() {
-                    self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(c.clone())));
+                    std::fs::write(digest_path, json!(self.digest).to_string()).ok();
                 }
             }
         }
@@ -865,23 +809,15 @@ impl TransferJob {
                     }
                 }
             }
-            DataSource::MemoryCursor(c) => {
-                if self.data_stream.is_none() {
-                    let mut t = std::io::Cursor::new(Vec::new());
-                    std::mem::swap(&mut t, c);
-                    self.data_stream = Some(DataStream::BufStream(TokioBufStream::new(t)));
-                }
-            }
         }
         Ok(false)
     }
 
     /// Get current file's digest (last_modified, file_size) for overwrite detection.
     async fn get_current_digest(&self) -> ResultType<(u64, u64)> {
-        let meta = match self.data_stream.as_ref().ok_or(anyhow!("file is None"))? {
-            DataStream::FileStream(file) => file.metadata().await?,
-            DataStream::BufStream(_) => bail!("No digest for buf stream"),
-        };
+        let DataStream::FileStream(file) =
+            self.data_stream.as_ref().ok_or(anyhow!("file is None"))?;
+        let meta = file.metadata().await?;
         let last_modified = meta
             .modified()?
             .duration_since(SystemTime::UNIX_EPOCH)?
@@ -947,7 +883,6 @@ impl TransferJob {
                     &self.files[file_num].name
                 }
             }
-            DataSource::MemoryCursor(..) => "",
         };
         const BUF_SIZE: usize = 128 * 1024;
         let mut buf: Vec<u8> = vec![0; BUF_SIZE];
@@ -978,17 +913,13 @@ impl TransferJob {
         }
         unsafe { buf.set_len(offset) };
         if offset == 0 {
-            if matches!(self.data_source, DataSource::MemoryCursor(_)) {
-                self.data_stream.take();
-                return Ok(None);
-            }
             self.file_num += 1;
             self.data_stream = None;
             self.file_confirmed = false;
             self.file_is_waiting = false;
         } else {
             self.finished_size += offset as u64;
-            if matches!(self.data_source, DataSource::FilePath(_)) && !is_compressed_file(name) {
+            if !is_compressed_file(name) {
                 let tmp = compress(&buf);
                 if tmp.len() < buf.len() {
                     buf = tmp;
@@ -1102,53 +1033,52 @@ impl TransferJob {
     }
 
     async fn set_stream_offset(&mut self, file_num: usize, offset: u64) {
-        if let DataSource::FilePath(p) = &self.data_source {
-            let entry = &self.files[file_num];
-            let Some(path) = self.resolve_entry_path(p, &entry.name) else {
-                return;
-            };
-            let file_path = get_string(&path);
-            let download_path = format!("{}.download", &file_path);
-            let digest_path = format!("{}.digest", &file_path);
+        let DataSource::FilePath(p) = &self.data_source;
+        let entry = &self.files[file_num];
+        let Some(path) = self.resolve_entry_path(p, &entry.name) else {
+            return;
+        };
+        let file_path = get_string(&path);
+        let download_path = format!("{}.download", &file_path);
+        let digest_path = format!("{}.digest", &file_path);
 
-            let mut f = if Path::new(&download_path).exists() && Path::new(&digest_path).exists() {
-                // If both download and digest files exist, seek (writer) to the offset
-                // NOTE: same as write path: best-effort symlink validation happened earlier,
-                // but this reopen remains TOCTOU-prone by design for now.
-                match OpenOptions::new()
-                    .create(true)
-                    .write(true)
-                    .open(&download_path)
-                    .await
-                {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("Failed to open file {}: {}", download_path, e);
-                        return;
-                    }
+        let mut f = if Path::new(&download_path).exists() && Path::new(&digest_path).exists() {
+            // If both download and digest files exist, seek (writer) to the offset
+            // NOTE: same as write path: best-effort symlink validation happened earlier,
+            // but this reopen remains TOCTOU-prone by design for now.
+            match OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&download_path)
+                .await
+            {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("Failed to open file {}: {}", download_path, e);
+                    return;
                 }
-            } else if Path::new(&file_path).exists() {
-                // If `file_path` exists, seek (reader) to the offset
-                match File::open(&file_path).await {
-                    Ok(f) => f,
-                    Err(e) => {
-                        log::warn!("Failed to open file {}: {}", file_path, e);
-                        return;
-                    }
-                }
-            } else {
-                log::warn!(
-                    "File {} not found, cannot seek to offset {}",
-                    file_path,
-                    offset
-                );
-                return;
-            };
-            if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
-                self.data_stream = Some(DataStream::FileStream(f));
-                self.transferred += offset;
-                self.finished_size += offset;
             }
+        } else if Path::new(&file_path).exists() {
+            // If `file_path` exists, seek (reader) to the offset
+            match File::open(&file_path).await {
+                Ok(f) => f,
+                Err(e) => {
+                    log::warn!("Failed to open file {}: {}", file_path, e);
+                    return;
+                }
+            }
+        } else {
+            log::warn!(
+                "File {} not found, cannot seek to offset {}",
+                file_path,
+                offset
+            );
+            return;
+        };
+        if f.seek(std::io::SeekFrom::Start(offset)).await.is_ok() {
+            self.data_stream = Some(DataStream::FileStream(f));
+            self.transferred += offset;
+            self.finished_size += offset;
         }
     }
 
