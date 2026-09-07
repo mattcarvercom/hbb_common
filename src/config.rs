@@ -168,6 +168,15 @@ lazy_static::lazy_static! {
     pub static ref APP_HOME_DIR: RwLock<String> = Default::default();
 }
 
+pub const LINK_DOCS_HOME: &str = "https://rustdesk.com/docs/en/";
+pub const LINK_DOCS_X11_REQUIRED: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
+
+lazy_static::lazy_static! {
+    pub static ref HELPER_URL: HashMap<&'static str, &'static str> = HashMap::from([
+        ("rustdesk docs home", LINK_DOCS_HOME),
+        ("rustdesk docs x11-required", LINK_DOCS_X11_REQUIRED),
+        ]);
+}
 const NUM_CHARS: &[char] = &['0', '1', '2', '3', '4', '5', '6', '7', '8', '9'];
 
 const CHARS: &[char] = &[
@@ -3062,6 +3071,9 @@ pub mod keys {
     pub const OPTION_ENABLE_OPEN_NEW_CONNECTIONS_IN_TABS: &str =
         "enable-open-new-connections-in-tabs";
     pub const OPTION_TEXTURE_RENDER: &str = "use-texture-render";
+    // Internal health record written by the texture-render watchdog/probe;
+    // "failed-*" flips the texture-render default to opt-in on this machine.
+    pub const OPTION_TEXTURE_RENDER_HEALTH: &str = "texture-render-health";
     pub const OPTION_ALLOW_D3D_RENDER: &str = "allow-d3d-render";
     pub const OPTION_ENABLE_CHECK_UPDATE: &str = "enable-check-update";
     pub const OPTION_ALLOW_AUTO_UPDATE: &str = "allow-auto-update";
@@ -3102,11 +3114,13 @@ pub mod keys {
     pub const OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN: &str = "allow-only-conn-window-open";
     pub const OPTION_ALLOW_AUTO_RECORD_INCOMING: &str = "allow-auto-record-incoming";
     pub const OPTION_ALLOW_AUTO_RECORD_OUTGOING: &str = "allow-auto-record-outgoing";
+    pub const OPTION_HIDE_RECORDING_BUTTON: &str = "hide-recording-button";
+    pub const OPTION_WINDOWS_SERVICE_VIDEO_SAVE_DIRECTORY: &str =
+        "windows-service-video-save-directory";
     pub const OPTION_VIDEO_SAVE_DIRECTORY: &str = "video-save-directory";
     pub const OPTION_ENABLE_ABR: &str = "enable-abr";
     pub const OPTION_ALLOW_REMOVE_WALLPAPER: &str = "allow-remove-wallpaper";
     pub const OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER: &str = "allow-always-software-render";
-    pub const OPTION_ALLOW_LINUX_HEADLESS: &str = "allow-linux-headless";
     pub const OPTION_ENABLE_HWCODEC: &str = "enable-hwcodec";
     pub const OPTION_APPROVE_MODE: &str = "approve-mode";
     pub const OPTION_VERIFICATION_METHOD: &str = "verification-method";
@@ -3158,6 +3172,7 @@ pub mod keys {
     pub const OPTION_PRESET_USERNAME: &str = "preset-user-name";
     pub const OPTION_PRESET_STRATEGY_NAME: &str = "preset-strategy-name";
     pub const OPTION_REMOVE_PRESET_PASSWORD_WARNING: &str = "remove-preset-password-warning";
+    pub const OPTION_HIDE_GENERAL_SETTINGS: &str = "hide-general-settings";
     pub const OPTION_HIDE_SECURITY_SETTINGS: &str = "hide-security-settings";
     pub const OPTION_HIDE_NETWORK_SETTINGS: &str = "hide-network-settings";
     pub const OPTION_HIDE_SERVER_SETTINGS: &str = "hide-server-settings";
@@ -3167,9 +3182,14 @@ pub mod keys {
     pub const OPTION_ALLOW_COMMAND_LINE_SETTINGS_WHEN_SETTINGS_DISABLED: &str =
         "allow-command-line-settings-when-settings-disabled";
 
-    // Connection punch-through options
+    // Connection punch-through / port-forward options
+    pub const OPTION_ENABLE_TCP_PUNCH: &str = "enable-tcp-punch";
     pub const OPTION_ENABLE_UDP_PUNCH: &str = "enable-udp-punch";
     pub const OPTION_ENABLE_IPV6_PUNCH: &str = "enable-ipv6-punch";
+    pub const OPTION_ENABLE_PORT_FORWARD_MUX: &str = "enable-port-forward-mux";
+    pub const OPTION_ENABLE_WEBRTC: &str = "enable-webrtc";
+    pub const OPTION_ALLOW_KCP_CC: &str = "allow-kcp-congestion-control";
+    pub const OPTION_ALLOW_WEBRTC_CC: &str = "allow-webrtc-congestion-control";
     pub const OPTION_HIDE_USERNAME_ON_CARD: &str = "hide-username-on-card";
     pub const OPTION_HIDE_HELP_CARDS: &str = "hide-help-cards";
     pub const OPTION_DEFAULT_CONNECT_PASSWORD: &str = "default-connect-password";
@@ -3197,6 +3217,8 @@ pub mod keys {
     pub const OPTION_FLUTTER_PEER_CARD_UI_TYLE: &str = "peer-card-ui-type";
     pub const OPTION_FLUTTER_CURRENT_AB_NAME: &str = "current-ab-name";
     pub const OPTION_ALLOW_REMOTE_CM_MODIFICATION: &str = "allow-remote-cm-modification";
+    pub const OPTION_ALLOW_SYNC_CLIPBOARD_BETWEEN_SESSIONS: &str =
+        "allow-sync-clipboard-between-sessions";
 
     // android floating window options
     pub const OPTION_DISABLE_FLOATING_WINDOW: &str = "disable-floating-window";
@@ -3292,10 +3314,16 @@ pub mod keys {
         OPTION_DISABLE_DISCOVERY_PANEL,
         OPTION_PRE_ELEVATE_SERVICE,
         OPTION_ALLOW_REMOTE_CM_MODIFICATION,
+        OPTION_ALLOW_SYNC_CLIPBOARD_BETWEEN_SESSIONS,
+        OPTION_ENABLE_CHECK_UPDATE,
         OPTION_ALLOW_AUTO_RECORD_OUTGOING,
+        OPTION_HIDE_RECORDING_BUTTON,
         OPTION_VIDEO_SAVE_DIRECTORY,
+        OPTION_ENABLE_TCP_PUNCH,
         OPTION_ENABLE_UDP_PUNCH,
         OPTION_ENABLE_IPV6_PUNCH,
+        OPTION_ENABLE_PORT_FORWARD_MUX,
+        OPTION_ENABLE_WEBRTC,
         OPTION_TOUCH_MODE,
         OPTION_SHOW_VIRTUAL_MOUSE,
         OPTION_SHOW_VIRTUAL_JOYSTICK,
@@ -3332,10 +3360,10 @@ pub mod keys {
         OPTION_AUTO_DISCONNECT_TIMEOUT,
         OPTION_ALLOW_ONLY_CONN_WINDOW_OPEN,
         OPTION_ALLOW_AUTO_RECORD_INCOMING,
+        OPTION_WINDOWS_SERVICE_VIDEO_SAVE_DIRECTORY,
         OPTION_ENABLE_ABR,
         OPTION_ALLOW_REMOVE_WALLPAPER,
         OPTION_ALLOW_ALWAYS_SOFTWARE_RENDER,
-        OPTION_ALLOW_LINUX_HEADLESS,
         OPTION_ENABLE_HWCODEC,
         OPTION_APPROVE_MODE,
         OPTION_VERIFICATION_METHOD,
@@ -3364,6 +3392,8 @@ pub mod keys {
         OPTION_ALLOW_INSECURE_TLS_FALLBACK,
         OPTION_KEEP_AWAKE_DURING_INCOMING_SESSIONS,
         OPTION_ALLOW_AUTO_UPDATE,
+        OPTION_ALLOW_KCP_CC,
+        OPTION_ALLOW_WEBRTC_CC,
     ];
 
     // BUILDIN_SETTINGS
@@ -3374,6 +3404,7 @@ pub mod keys {
         OPTION_PRESET_USERNAME,
         OPTION_PRESET_STRATEGY_NAME,
         OPTION_REMOVE_PRESET_PASSWORD_WARNING,
+        OPTION_HIDE_GENERAL_SETTINGS,
         OPTION_HIDE_SECURITY_SETTINGS,
         OPTION_HIDE_NETWORK_SETTINGS,
         OPTION_HIDE_SERVER_SETTINGS,

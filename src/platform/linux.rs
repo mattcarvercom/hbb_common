@@ -365,7 +365,7 @@ pub fn system_message(title: &str, msg: &str, forever: bool) -> ResultType<()> {
     crate::bail!("failed to post system message");
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde_derive::Serialize, serde_derive::Deserialize)]
 pub struct WaylandDisplayInfo {
     pub name: String,
     pub x: i32,
@@ -374,10 +374,72 @@ pub struct WaylandDisplayInfo {
     pub height: i32,
     pub logical_size: Option<(i32, i32)>,
     pub refresh_rate: i32,
+    /// Output rotation in degrees (0/90/180/270), from `wl_output.geometry`. The mode keeps its
+    /// unrotated dimensions and `logical_size` arrives already swapped, so without this field a
+    /// rotated output is indistinguishable from a scaled one. Flipped variants map to their
+    /// rotation. Defaulted so a serialized snapshot from an older probe child still deserializes.
+    #[serde(default)]
+    pub transform: i32,
 }
+
+/// The isolated socket-probe fallback, in its own file and behind the `wayland_probe` feature so
+/// the base Wayland path never compiles it. The DRM login-screen build turns it on.
+#[cfg(feature = "wayland_probe")]
+pub mod wayland_probe;
+#[cfg(feature = "wayland_probe")]
+pub use wayland_probe::{wayland_display_probe_child_main, WAYLAND_DISPLAY_PROBE_ARG};
 
 // Retrieves information about all connected displays via the Wayland protocol.
 pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
+    // Read before connecting: `connect_to_env` consumes `WAYLAND_SOCKET`. Only the probe fallback
+    // needs this, so it is computed only when that feature is compiled in.
+    #[cfg(feature = "wayland_probe")]
+    let named_endpoint = wayland_probe::env_names_wayland_endpoint();
+    match Connection::connect_to_env() {
+        Ok(conn) => collect_wayland_displays(&conn),
+        // Without the feature, the connect error is final, exactly as before this fallback existed.
+        #[cfg(not(feature = "wayland_probe"))]
+        Err(err) => Err(err.into()),
+        #[cfg(feature = "wayland_probe")]
+        Err(err) => wayland_probe::wayland_displays_from_runtime_dir(named_endpoint)
+            .map_err(|fallback_err| anyhow::anyhow!("{err}; {fallback_err}")),
+    }
+}
+
+/// `wl_output::Transform` as degrees. Flipped variants report their rotation ONLY: wayland
+/// defines them as a vertical-axis mirror followed by the rotation, and the mirror half is
+/// dropped here - a consumer correcting frames by this value serves a flipped output mirrored.
+/// Said once in the log rather than silently, because no compositor of ours produces a flipped
+/// output to measure the mirror half against; carrying it must wait for a measured producer.
+fn transform_degrees(t: sctk::reexports::client::protocol::wl_output::Transform) -> i32 {
+    use sctk::reexports::client::protocol::wl_output::Transform;
+    match t {
+        Transform::Normal => 0,
+        Transform::_90 => 90,
+        Transform::_180 => 180,
+        Transform::_270 => 270,
+        Transform::Flipped | Transform::Flipped90 | Transform::Flipped180
+        | Transform::Flipped270 => {
+            static FLIPPED_WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !FLIPPED_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::warn!(
+                    "an output reports a flipped transform ({t:?}); only its rotation is \
+                     corrected, the mirror is not"
+                );
+            }
+            match t {
+                Transform::Flipped90 => 90,
+                Transform::Flipped180 => 180,
+                Transform::Flipped270 => 270,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn collect_wayland_displays(conn: &Connection) -> ResultType<Vec<WaylandDisplayInfo>> {
     struct WaylandEnv {
         registry_state: RegistryState,
         output_state: OutputState,
@@ -398,14 +460,13 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
             &mut self.registry_state
         }
 
-        sctk::registry_handlers!();
+        sctk::registry_handlers![OutputState];
     }
 
     sctk::delegate_output!(WaylandEnv);
     sctk::delegate_registry!(WaylandEnv);
 
-    let conn = Connection::connect_to_env()?;
-    let (globals, mut event_queue) = globals::registry_queue_init(&conn)?;
+    let (globals, mut event_queue) = globals::registry_queue_init(conn)?;
     let queue_handle = event_queue.handle();
 
     let registry_state = RegistryState::new(&globals);
@@ -425,11 +486,16 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
         if let Some(output_data) = output.data::<OutputData>() {
             output_data.with_output_info(|info| {
                 if let Some(mode) = info.modes.iter().find(|m| m.current) {
-                    let (x, y) = info.location;
+                    // wlroots compositors leave wl_output.geometry at (0, 0) for every output and
+                    // publish the real layout only through xdg-output, so taking `location` there
+                    // stacks the whole desktop on the origin. Mutter fills both, so this stays a
+                    // no-op on GNOME.
+                    let (x, y) = info.logical_position.unwrap_or(info.location);
                     let (width, height) = mode.dimensions;
                     let refresh_rate = mode.refresh_rate;
                     let name = info.name.clone().unwrap_or_default();
                     let logical_size = info.logical_size;
+                    let transform = transform_degrees(info.transform);
                     display_infos.push(WaylandDisplayInfo {
                         name,
                         x,
@@ -438,6 +504,7 @@ pub fn get_wayland_displays() -> ResultType<Vec<WaylandDisplayInfo>> {
                         height,
                         logical_size,
                         refresh_rate,
+                        transform,
                     });
                 }
             });
@@ -500,6 +567,38 @@ pub fn get_home_dir_trusted() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_transform_degrees_maps_all_eight_variants() {
+        use sctk::reexports::client::protocol::wl_output::Transform;
+        // Flipped variants report their rotation: the frame still needs that turn to read
+        // upright, and the mirror half has no producer among desktop compositors to test.
+        for (t, deg) in [
+            (Transform::Normal, 0),
+            (Transform::_90, 90),
+            (Transform::_180, 180),
+            (Transform::_270, 270),
+            (Transform::Flipped, 0),
+            (Transform::Flipped90, 90),
+            (Transform::Flipped180, 180),
+            (Transform::Flipped270, 270),
+        ] {
+            assert_eq!(transform_degrees(t), deg, "{t:?}");
+        }
+    }
+
+    #[test]
+    fn test_display_info_without_transform_defaults_to_zero() {
+        // A snapshot serialized by an older probe child carries no transform field; it must
+        // deserialize with 0 rather than fail, or a greeter-side child update becomes a
+        // lockstep upgrade.
+        let old = r#"{"name":"HDMI-1","x":0,"y":0,"width":1920,"height":1080,"logical_size":null,"refresh_rate":60}"#;
+        let info: WaylandDisplayInfo = serde_json::from_str(old).unwrap();
+        assert_eq!(info.transform, 0);
+        let roundtrip: WaylandDisplayInfo =
+            serde_json::from_str(&serde_json::to_string(&info).unwrap()).unwrap();
+        assert_eq!(roundtrip.transform, 0);
+    }
 
     #[test]
     fn test_run_cmds_trim_newline() {
