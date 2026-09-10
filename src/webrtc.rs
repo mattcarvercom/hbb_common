@@ -494,6 +494,12 @@ impl WebRTCStream {
     }
 
     #[inline]
+    fn get_cc_enabled() -> bool {
+        let k = config::keys::OPTION_ALLOW_WEBRTC_CC;
+        config::option2bool(k, &config::Config::get_option(k))
+    }
+
+    #[inline]
     fn get_ice_servers() -> Vec<RTCIceServer> {
         Self::parse_ice_servers(&config::Config::get_option(
             config::keys::OPTION_ICE_SERVERS,
@@ -619,10 +625,10 @@ impl WebRTCStream {
             IpAddr::V4(_) => true,
         }));
 
-        // NOTE: `webrtc::sctp::association::set_no_congestion_control` (used to apply the
-        // `allow-webrtc-cc` option per connection) is unavailable in the pinned webrtc 0.13
-        // (-sctp 0.12). Re-add it here, together with `get_cc_enabled`, once the crate is
-        // bumped (see the upgrade checklist at the top of this file).
+        // KCP's nc=1 profile by default, with the same opt-in to a congestion window as
+        // `allow-kcp-congestion-control`, for the reason given at `get_kcp_cc_enabled`. Set per
+        // connection so the option takes effect on the next session, not the next start.
+        webrtc::sctp::association::set_no_congestion_control(!Self::get_cc_enabled());
 
         // Create the API object
         let api = APIBuilder::new().with_setting_engine(s).build();
