@@ -46,6 +46,19 @@ use crate::{
 
 pub const CONNECT_TIMEOUT: u64 = 18_000;
 pub const READ_TIMEOUT: u64 = 18_000;
+// Default relay/rendezvous ports. The LAN pivot removes the cloud connection
+// flow, but the shared connection infrastructure (socket_client, websocket,
+// stream) still names these constants, so they stay defined.
+pub const RENDEZVOUS_PORT: i32 = 21116;
+pub const RELAY_PORT: i32 = 21117;
+pub const WS_RENDEZVOUS_PORT: i32 = 21118;
+pub const WS_RELAY_PORT: i32 = 21119;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkType {
+    Direct,
+    ProxySocks,
+}
 // https://github.com/quic-go/quic-go/issues/525#issuecomment-294531351
 // https://datatracker.ietf.org/doc/html/draft-hamilton-early-deployment-quic-00#section-6.10
 // 15 seconds is recommended by quic, though oneSIP recommend 25 seconds,
@@ -667,6 +680,22 @@ pub fn store_path<T: serde::Serialize>(path: PathBuf, cfg: T) -> crate::ResultTy
 }
 
 impl Config {
+    // Stubs for the cloud/relay config removed by the LAN pivot. The shared
+    // connection infrastructure (socket_client, websocket) still calls these, so
+    // they stay defined but return "no cloud" values: no rendezvous server, no
+    // SOCKS proxy, and a direct (non-relayed) network type.
+    pub fn get_rendezvous_server() -> String {
+        String::new()
+    }
+
+    pub fn get_socks() -> Option<Socks5Server> {
+        None
+    }
+
+    pub fn get_network_type() -> NetworkType {
+        NetworkType::Direct
+    }
+
     fn load_<T: serde::Serialize + serde::de::DeserializeOwned + Default + std::fmt::Debug>(
         suffix: &str,
     ) -> T {
